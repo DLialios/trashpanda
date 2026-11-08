@@ -619,6 +619,11 @@ fn install(updater: &update::Updater, release: &update::Release, exe: &Path) -> 
     })
 }
 
+/// Whether an update left a build it downloaded behind in `dir`.
+fn staged_left(dir: &Path) -> bool {
+    fs::read_dir(dir).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(update::STAGED))
+}
+
 /// Offer release 0.3.0 to a 0.2.0 build for `platform`, serving `build` and
 /// `signature` for it, and return why installing it failed. The program
 /// must be left as it was. `name` names the scratch directory.
@@ -632,7 +637,7 @@ fn refusal(name: &str, platform: &str, build: &[u8], signature: &str) -> String 
     fs::write(&exe, OLD_BUILD).unwrap();
     let error = install(&updater, &release, &exe).unwrap_err();
     assert_eq!(fs::read(&exe).unwrap(), OLD_BUILD);
-    assert!(!temp.0.join(update::STAGED).exists());
+    assert!(!staged_left(&temp.0));
     format!("{error:#}")
 }
 
@@ -682,7 +687,7 @@ fn installs_a_signed_newer_build() {
     fs::write(&exe, OLD_BUILD).unwrap();
     install(&updater, &release, &exe).unwrap();
     assert_eq!(fs::read(&exe).unwrap(), NEW_BUILD);
-    assert!(!temp.0.join(update::STAGED).exists());
+    assert!(!staged_left(&temp.0));
     // latest.json is found through the redirect, the build in the release it names.
     assert_eq!(*server.requests.lock().unwrap(), [
         "/releases/latest/download/latest.json",
@@ -695,6 +700,25 @@ fn installs_a_signed_newer_build() {
     // An unreachable server is an error, not "up to date".
     let gone = update::Updater::with("http://127.0.0.1:9/releases", "linux-x86_64", update::current(), TEST_KEY);
     assert!(gone.unwrap().check().is_err());
+}
+
+#[test]
+fn a_second_update_cannot_spoil_the_first_ones_build() {
+    let server = release_with(LINUX, NEW_BUILD, NEW_SIGNATURE);
+    let updater = updater(&server, "linux-x86_64", "0.2.0");
+    let release = updater.check().unwrap().unwrap();
+    let temp = TempDir::new("two-updates");
+    let exe = temp.0.join("trashpanda");
+    fs::write(&exe, OLD_BUILD).unwrap();
+    // A second update starts after the first has checked its build, and
+    // fails to download its own.
+    let gone = update::Updater::with("http://127.0.0.1:9/releases", "linux-x86_64", "0.2.0".parse().unwrap(), TEST_KEY);
+    updater.install_at(&release, &exe, |staged| {
+        assert!(gone.unwrap().install_at(&release, &exe, |_| unreachable!()).is_err());
+        fs::copy(staged, &exe).map(drop)
+    }).unwrap();
+    assert_eq!(fs::read(&exe).unwrap(), NEW_BUILD);
+    assert!(!staged_left(&temp.0));
 }
 
 #[test]

@@ -14,6 +14,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -24,7 +25,8 @@ use minisign_verify::{PublicKey, Signature};
 pub const RELEASES: &str = "https://github.com/DLialios/trashpanda/releases";
 /// The public half of the release signing key.
 const PUBLIC_KEY: &str = include_str!("../minisign.pub");
-/// The file a new build is written to, next to the running program.
+/// How the name of the file a new build is written to, next to the running
+/// program, starts. Each update attempt writes to a file of its own.
 pub const STAGED: &str = ".trashpanda-update";
 
 /// A `major.minor.patch` version.
@@ -176,6 +178,9 @@ impl Updater {
     /// program. Returns the program's path, to start the new version from.
     pub fn install(&self, release: &Release) -> Result<PathBuf> {
         let exe = std::env::current_exe().context("finding the running program")?;
+        #[cfg(windows)]
+        self.install_at(release, &exe, |staged| swap_on_windows(&exe, staged))?;
+        #[cfg(not(windows))]
         self.install_at(release, &exe, |staged| self_replace::self_replace(staged))?;
         Ok(exe)
     }
@@ -186,9 +191,8 @@ impl Updater {
     pub fn install_at(&self, release: &Release, exe: &Path, swap: impl FnOnce(&Path) -> io::Result<()>) -> Result<()> {
         let dir = exe.parent().context("the program has no folder")?;
         let unwritable = |error| anyhow!(Unwritable { dir: dir.into(), page: release.page.clone(), error });
-        let staged = dir.join(STAGED);
         // Find out whether the folder is writable before downloading anything.
-        let mut file = File::create(&staged).map_err(unwritable)?;
+        let (staged, mut file) = create_staged(dir).map_err(unwritable)?;
         let result = (|| {
             let build = self.download(release)?;
             file.write_all(&build).and_then(|()| file.sync_all()).map_err(unwritable)?;
@@ -203,6 +207,41 @@ impl Updater {
         _ = fs::remove_file(&staged);
         result
     }
+}
+
+/// Create a new, empty file in `dir` to write a build to. Each attempt gets
+/// a file of its own, so that a second update running at the same time
+/// cannot empty or delete a build the first has already checked.
+fn create_staged(dir: &Path) -> io::Result<(PathBuf, File)> {
+    static ATTEMPT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{STAGED}-{}-{attempt}", std::process::id()));
+        match File::options().write(true).create_new(true).open(&path) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            result => return result.map(|file| (path, file)),
+        }
+    }
+}
+
+/// Put the build at `staged` in place of the running program at `exe`.
+/// `self_replace` moves the program aside before copying the build in, so
+/// a failed copy (a full drive, say) leaves no program at all. Renaming
+/// within the folder needs no space, and the first rename is undone if the
+/// second fails. The old program is deleted once this process exits.
+#[cfg(windows)]
+fn swap_on_windows(exe: &Path, staged: &Path) -> io::Result<()> {
+    let mut old = staged.as_os_str().to_owned();
+    old.push(".old");
+    let old = PathBuf::from(old);
+    fs::rename(exe, &old)?;
+    if let Err(error) = fs::rename(staged, exe) {
+        _ = fs::rename(&old, exe);
+        return Err(error);
+    }
+    // Should this fail, the old program is left behind as a stray file.
+    _ = self_replace::self_delete_at(&old);
+    Ok(())
 }
 
 /// Start the program at `exe` again, which opens its window; this process
