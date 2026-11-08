@@ -114,7 +114,7 @@ The manifest is usually still in `depotcache/` after an install, under
 
 ## Usage
 
-`rin-dl` downloads every depot in a manifest package into the current
+`trashpanda` downloads every depot in a manifest package into the current
 directory. A package is a zip holding a `.lua` file with the depot keys
 (`addappid(<depot>, 1, "<64 hex digits>")` lines) and the depots' `.manifest`
 files, such as `2862860.zip`. It needs no Steam login: content servers come
@@ -126,7 +126,7 @@ Requires a stable [Rust](https://rustup.rs/) toolchain. Build on the system
 that will run it:
 
 ```bash
-cargo build --release   # target/release/rin-dl, or rin-dl.exe on Windows
+cargo build --release   # target/release/trashpanda (.exe on Windows)
 ```
 
 On Windows, rustup's default MSVC toolchain is all that is needed. To build a
@@ -138,7 +138,7 @@ then run `rustup target add x86_64-pc-windows-gnu` and
 
 ```bash
 cd /where/the/game/goes
-rin-dl ~/Downloads/2862860.zip
+trashpanda ~/Downloads/2862860.zip
 ```
 
 ```
@@ -172,14 +172,14 @@ for another system, or shared redistributables like DirectX. `-l` lists the
 depots and stops; `-d 2862861,228989` downloads only the depots named.
 
 ```bash
-rin-dl ~/Downloads/2862860.zip -l
-rin-dl ~/Downloads/2862860.zip -d 2862861
+trashpanda ~/Downloads/2862860.zip -l
+trashpanda ~/Downloads/2862860.zip -d 2862861
 ```
 
 ### Window
 
-Run `rin-dl` without arguments, or double-click it; the window is titled
-The Gupta Promise. Choose the package (or drop it on the window); the window
+Run `trashpanda` without arguments, or double-click it; the window is titled
+Trash Panda. Choose the package (or drop it on the window); the window
 then shows what is in it: the game, app ID and build, and each depot's ID,
 manifest ID, date, file count and size. Check the output folder, which
 starts as the directory the program was started from.
@@ -250,8 +250,8 @@ Steam's installation records. The regular
 [DepotDownloader](https://github.com/SteamRE/DepotDownloader) cannot take
 local key and manifest inputs;
 [DepotDownloaderMod](https://github.com/lunaeves/DepotDownloaderMod) adds
-them but uses .NET and an anonymous Steam session. `rin-dl` talks to the CDN
-over HTTPS directly.
+them but uses .NET and an anonymous Steam session. `trashpanda` talks to
+the CDN over HTTPS directly.
 
 The tests run offline, with local HTTP servers standing in for the CDN:
 

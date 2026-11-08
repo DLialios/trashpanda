@@ -1,5 +1,5 @@
 [package]
-name = "rin-dl"
+name = "trashpanda"
 version = "0.1.0"
 edition = "2024"
 description = "Download Steam depots from a manifest package, with resume"

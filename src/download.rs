@@ -106,7 +106,7 @@ pub fn agent(jobs: usize) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_global(Some(Duration::from_secs(120)))
-        .user_agent(concat!("rin-dl/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("trashpanda/", env!("CARGO_PKG_VERSION")))
         .max_idle_connections(jobs * 4)
         .max_idle_connections_per_host(jobs)
         .build()

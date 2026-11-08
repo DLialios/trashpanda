@@ -1,5 +1,5 @@
-//! rin-dl: download Steam depots from a manifest package. Given a package it
-//! runs in the terminal; without arguments it opens a window.
+//! trashpanda: download Steam depots from a manifest package. Given a
+//! package it runs in the terminal; without arguments it opens a window.
 
 mod depot;
 mod download;
@@ -20,8 +20,8 @@ use download::{Meter, Progress};
 pub const DEFAULT_JOBS: usize = 16;
 
 const USAGE: &str = "\
-Usage: rin-dl PACKAGE.zip [-o DIR] [-j N] [-d ID,ID...] [-l]
-       rin-dl            (opens the window)
+Usage: trashpanda PACKAGE.zip [-o DIR] [-j N] [-d ID,ID...] [-l]
+       trashpanda        (opens the window)
 
 Downloads every depot in PACKAGE.zip (a .lua file with depot keys plus the
 depots' .manifest files) into the current directory. Run it again to resume:

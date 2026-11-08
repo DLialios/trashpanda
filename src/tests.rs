@@ -122,7 +122,7 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("rin-dl-test-{}-{name}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("trashpanda-test-{}-{name}", std::process::id()));
         _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         TempDir(path)

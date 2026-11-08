@@ -13,7 +13,7 @@ use eframe::egui;
 use crate::depot::{self, Package};
 use crate::download::{self, Meter, OnDisk, Progress};
 
-const TITLE: &str = "The Gupta Promise";
+const TITLE: &str = "Trash Panda";
 
 pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
