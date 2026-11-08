@@ -23,6 +23,7 @@ pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(TITLE)
+            .with_icon(icon())
             .with_inner_size([800.0, 640.0])
             .with_drag_and_drop(true),
         ..Default::default()
@@ -33,6 +34,14 @@ pub fn run() -> eframe::Result {
         app.check_for_update(true);
         Ok(Box::new(app))
     }))
+}
+
+/// The icon of the window, which the title bar and taskbar show. eframe
+/// scales it to each size; on Windows the .exe also carries hand-drawn small
+/// sizes for Explorer (see build.rs).
+pub fn icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .expect("assets/icon.png is a PNG")
 }
 
 /// What is chosen: the package path and output folder as typed, and the

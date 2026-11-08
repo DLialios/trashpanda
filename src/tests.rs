@@ -820,3 +820,10 @@ fn sends_users_to_the_release_page_when_the_folder_is_read_only() {
     // It gives up before downloading the build.
     assert!(!server.requests.lock().unwrap().iter().any(|path| path.contains(LINUX)));
 }
+
+#[test]
+fn window_icon_is_a_square_png() {
+    let icon = crate::gui::icon();
+    assert_eq!((icon.width, icon.height), (256, 256));
+    assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+}

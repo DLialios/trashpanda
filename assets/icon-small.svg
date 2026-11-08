@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- icon.svg cut for 16 to 24 px: a bigger disc and head, bigger eyes, and
+       no inner ears, which would only blur at that size. -->
+  <defs>
+    <linearGradient id="disc" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#111d2e"/>
+      <stop offset=".35" stop-color="#0d2550"/>
+      <stop offset=".7" stop-color="#144b7e"/>
+      <stop offset="1" stop-color="#1387b8"/>
+    </linearGradient>
+    <mask id="holes">
+      <rect width="256" height="256" fill="#fff"/>
+      <path fill="#000" d="M 26 164 C 40 136 74 124 100 130 C 112 133 120 140 128 140 C 136 140 144 133 156 130
+        C 182 124 216 136 230 164 C 216 182 192 188 170 182 C 152 177 142 166 128 166
+        C 114 166 104 177 86 182 C 64 188 40 182 26 164 Z"/>
+      <path fill="#000" d="M 110 180 C 110 170 146 170 146 180 C 146 192 136 198 128 198
+        C 120 198 110 192 110 180 Z"/>
+    </mask>
+  </defs>
+  <circle cx="128" cy="128" r="124" fill="url(#disc)"/>
+  <g transform="translate(28.16 32.16) scale(0.78)">
+    <g mask="url(#holes)" fill="#fff">
+      <path d="M 44 128 C 32 92 38 56 58 36 C 82 38 106 58 118 80 Z"/>
+      <path d="M 212 128 C 224 92 218 56 198 36 C 174 38 150 58 138 80 Z"/>
+      <path d="M 128 64 C 168 64 196 84 206 110 C 220 124 234 148 242 174 C 228 172 218 174 210 178
+        C 196 206 164 224 128 226 C 92 224 60 206 46 178 C 38 174 28 172 14 174
+        C 22 148 36 124 50 110 C 60 84 88 64 128 64 Z"/>
+    </g>
+    <circle cx="90" cy="155" r="14" fill="#fff"/>
+    <circle cx="166" cy="155" r="14" fill="#fff"/>
+  </g>
+</svg>

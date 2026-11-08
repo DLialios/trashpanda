@@ -26,3 +26,6 @@ windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 
 [profile.release]
 strip = true
+
+[build-dependencies]
+embed-resource = "3.0.12"
