@@ -4,6 +4,7 @@
 mod depot;
 mod download;
 mod gui;
+mod log;
 #[cfg(test)]
 mod tests;
 mod update;
@@ -21,7 +22,7 @@ use download::{Meter, Progress};
 pub const DEFAULT_JOBS: usize = 16;
 
 const USAGE: &str = "\
-Usage: trashpanda PACKAGE.zip [-o DIR] [-j N] [-d ID,ID...] [-l]
+Usage: trashpanda PACKAGE.zip [-o DIR] [-j N] [-d ID,ID...] [-l] [--log FILE]
        trashpanda           (opens the window)
        trashpanda --update  (replaces this program with the newest release)
 
@@ -32,18 +33,22 @@ chunks already on disk are checked and kept, so it also repairs damaged files.
   -o, --output DIR      download into DIR instead of the current directory
   -j, --jobs N          parallel chunk downloads (default 16)
   -d, --depots ID,ID    download only these depots
-  -l, --list            show the app and depots in the package and stop";
+  -l, --list            show the app and depots in the package and stop
+      --log FILE        save a detailed log to FILE, for bug reports";
 
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);
     if args.len() == 0 {
+        log::start("window");
         hide_console();
         return match gui::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(&format!("could not open the window: {error}")),
         };
     }
+    log::start("terminal");
     let (mut package, mut output, mut jobs, mut depots, mut list) = (None, None, DEFAULT_JOBS, None, false);
+    let mut log_file = None;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-h" | "--help") => {
@@ -69,11 +74,16 @@ fn main() -> ExitCode {
                 }
             }
             Some("-l" | "--list") => list = true,
+            Some("--log") => match args.next() {
+                Some(file) => log_file = Some(log::SaveOnDrop(PathBuf::from(file))),
+                None => return fail("--log needs a file"),
+            },
             Some(flag) if flag.starts_with('-') => return fail(&format!("unknown option {flag}\n\n{USAGE}")),
             _ if package.is_none() => package = Some(PathBuf::from(arg)),
             _ => return fail("give only one package"),
         }
     }
+    let _log_file = log_file; // Saves the log when main returns, however it returns.
     let Some(package) = package else { return fail(&format!("no package given\n\n{USAGE}")) };
     let output = match output.map_or_else(env::current_dir, Ok) {
         Ok(output) => output,
@@ -93,10 +103,13 @@ fn main() -> ExitCode {
         download::describe(&package).iter().chain(&package.warnings).for_each(|line| println!("{line}"));
         return ExitCode::SUCCESS;
     }
+    log::write(format!("cli: output {output:?}, jobs {jobs}, depots {:?}",
+                       package.depots.iter().map(|depot| depot.id).collect::<Vec<_>>()));
     cli(package, output, jobs)
 }
 
 fn fail(message: &str) -> ExitCode {
+    log::write(format!("Error: {message}"));
     eprintln!("Error: {message}");
     ExitCode::FAILURE
 }

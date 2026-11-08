@@ -20,6 +20,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use minisign_verify::{PublicKey, Signature};
 
+use crate::log;
+
 /// GitHub redirects `<RELEASES>/latest/download/<file>` to that file in the
 /// newest published release.
 pub const RELEASES: &str = "https://github.com/DLialios/trashpanda/releases";
@@ -113,8 +115,13 @@ impl Updater {
 
     /// The newest release, if it is newer than this build.
     pub fn check(&self) -> Result<Option<Release>> {
-        let latest = self.get("latest/download/latest.json", 64 << 10).context("checking for updates")?;
-        self.parse_latest(&String::from_utf8_lossy(&latest))
+        let failed = "could not check for updates";
+        let latest = self.get("latest/download/latest.json", 64 << 10).context(failed)?;
+        let latest = String::from_utf8_lossy(&latest);
+        log::write(format!("update: latest.json: {}", log::clip(&latest, 4 << 10)));
+        let release = self.parse_latest(&latest).context(failed)?;
+        log::write(format!("update: this is {} for {}; newer release: {release:?}", self.current, self.platform));
+        Ok(release)
     }
 
     /// The release `latest.json` describes,
@@ -138,16 +145,21 @@ impl Updater {
     /// the signature holds.
     pub fn download(&self, release: &Release) -> Result<Vec<u8>> {
         let path = format!("download/v{}/{}", release.version, release.asset);
-        let build = self.get(&path, 256 << 20).with_context(|| format!("downloading version {}", release.version))?;
-        let signature = self.get(&format!("{path}.minisig"), 4 << 10).context("downloading the signature")?;
+        let build = self.get(&path, 256 << 20).with_context(|| format!("could not download version {}", release.version))?;
+        let signature = self.get(&format!("{path}.minisig"), 4 << 10)
+            .with_context(|| format!("could not download the signature of version {}", release.version))?;
         self.verify(&build, &String::from_utf8_lossy(&signature), release)?;
+        log::write(format!("update: signature of version {} holds", release.version));
         Ok(build)
     }
 
     fn get(&self, path: &str, limit: u64) -> Result<Vec<u8>> {
         let url = format!("{}/{path}", self.releases);
+        log::write(format!("update: GET {url}"));
         let mut response = self.agent.get(&url).call()?;
-        Ok(response.body_mut().with_config().limit(limit).read_to_vec()?)
+        let body = response.body_mut().with_config().limit(limit).read_to_vec()?;
+        log::write(format!("update: {} bytes from {url}", body.len()));
+        Ok(body)
     }
 
     fn verify(&self, build: &[u8], signature: &str, release: &Release) -> Result<()> {
@@ -177,7 +189,8 @@ impl Updater {
     /// Download and check the release, and swap it in for the running
     /// program. Returns the program's path, to start the new version from.
     pub fn install(&self, release: &Release) -> Result<PathBuf> {
-        let exe = std::env::current_exe().context("finding the running program")?;
+        let exe = std::env::current_exe().context("could not find the running program")?;
+        log::write(format!("update: installing version {} over {exe:?}", release.version));
         #[cfg(windows)]
         self.install_at(release, &exe, |staged| swap_on_windows(&exe, staged))?;
         #[cfg(not(windows))]
@@ -193,6 +206,7 @@ impl Updater {
         let unwritable = |error| anyhow!(Unwritable { dir: dir.into(), page: release.page.clone(), error });
         // Find out whether the folder is writable before downloading anything.
         let (staged, mut file) = create_staged(dir).map_err(unwritable)?;
+        log::write(format!("update: writing the new build to {staged:?}"));
         let result = (|| {
             let build = self.download(release)?;
             file.write_all(&build).and_then(|()| file.sync_all()).map_err(unwritable)?;
@@ -205,6 +219,7 @@ impl Updater {
             swap(&staged).map_err(unwritable)
         })();
         _ = fs::remove_file(&staged);
+        log::write(format!("update: install {}", if result.is_ok() { "done" } else { "failed" }));
         result
     }
 }

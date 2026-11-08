@@ -10,6 +10,7 @@ anyhow = "1.0"
 cbc = { version = "0.2.1", features = ["alloc"] }
 crc32fast = "1.5.4"
 eframe = "0.37.0"
+egui_extras = { version = "0.37.0", default-features = false }
 lzma-rs = "0.3.0"
 minisign-verify = "0.3"
 rfd = "0.18.0"

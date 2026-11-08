@@ -15,6 +15,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use sha1::{Digest, Sha1};
 
 use crate::depot::{self, Chunk, Depot, Entry, Package};
+use crate::log;
 
 const SERVER_LIST: &str = "https://api.steampowered.com/IContentServerDirectoryService/\
                            GetServersForSteamPipe/v1/?cell_id=0&max_servers=20";
@@ -22,6 +23,8 @@ const SERVER_LIST: &str = "https://api.steampowered.com/IContentServerDirectoryS
 const MAX_FAILURES: usize = 20;
 /// Pause before the second round of retries; it doubles for the third.
 const RETRY_DELAY: Duration = Duration::from_millis(if cfg!(test) { 10 } else { 4000 });
+/// How often a download logs how far it has got.
+const REPORT_EVERY: Duration = Duration::from_secs(15);
 
 /// Progress shared between the download threads and the display.
 #[derive(Default)]
@@ -41,8 +44,11 @@ pub struct Progress {
 }
 
 impl Progress {
+    /// Add a line for the user, which also goes into the session log.
     pub fn log(&self, line: impl Into<String>) {
-        self.log.lock().unwrap().push(line.into());
+        let line = line.into();
+        log::write(&line);
+        self.log.lock().unwrap().push(line);
     }
 
     /// Log lines from index `from` onwards.
@@ -115,10 +121,16 @@ pub fn agent(jobs: usize) -> ureq::Agent {
 
 /// Ask Steam's public directory for content servers; no login is needed.
 pub fn content_servers(agent: &ureq::Agent) -> Result<Vec<String>> {
-    let body = agent.get(SERVER_LIST).call().context("fetching the Steam content server list")?
-        .body_mut().read_to_string()?;
-    let servers = parse_servers(&body)?;
-    ensure!(!servers.is_empty(), "Steam returned no unrestricted HTTPS content servers");
+    let failed = "could not get the list of download servers from Steam";
+    let started = Instant::now();
+    log::write(format!("servers: GET {SERVER_LIST}"));
+    let mut response = agent.get(SERVER_LIST).call().context(failed)?;
+    let body = response.body_mut().read_to_string().context(failed)?;
+    log::write(format!("servers: {} after {} ms: {}", response.status(), started.elapsed().as_millis(),
+                       log::clip(&body, 16 << 10)));
+    let servers = parse_servers(&body).context(failed)?;
+    log::write(format!("servers: usable {servers:?}"));
+    ensure!(!servers.is_empty(), "Steam offered no usable download servers");
     Ok(servers)
 }
 
@@ -170,9 +182,9 @@ fn plan<'a>(package: &'a Package, output: &Path) -> Result<(Vec<PathBuf>, Vec<Ta
             // Depots may share folders, but two files at one path would corrupt each other.
             let unique = if cfg!(windows) { entry.name.to_lowercase() } else { entry.name.clone() };
             match seen.insert(unique, depot.id) {
-                Some(other) if other == depot.id => bail!("{:?} appears twice in depot {other}", entry.name),
-                Some(other) => bail!("{:?} is in both depot {other} and depot {}; download only one of them \
-                                      (they may be the same game for different systems)", entry.name, depot.id),
+                Some(other) if other == depot.id => bail!("depot {other} lists {:?} twice", entry.name),
+                Some(other) => bail!("depots {other} and {} both contain {:?}; choose only one of them",
+                                     depot.id, entry.name),
                 None => {}
             }
             files.push(Target { path, entry, depot });
@@ -228,20 +240,25 @@ pub fn check(package: &Package, output: &Path, previous: Option<&OnDisk>, progre
              -> Result<Option<OnDisk>> {
     let (_, targets) = plan(package, output)?;
     progress.total.store(targets.iter().map(|target| target.entry.size).sum(), Relaxed);
+    log::write(format!("check: {output:?}, depots {:?}, {} bytes",
+                       package.depots.iter().map(|depot| depot.id).collect::<Vec<_>>(), progress.total.load(Relaxed)));
     check_files(&targets, previous, progress)
 }
 
 fn check_files(targets: &[Target], previous: Option<&OnDisk>, progress: &Progress) -> Result<Option<OnDisk>> {
+    let started = Instant::now();
     let mut on_disk = OnDisk::default();
     let mut queue = Vec::new();
+    let (mut present, mut reused) = (0, 0);
     for (t, target) in targets.iter().enumerate() {
         let meta = match fs::metadata(&target.path) {
             Ok(meta) if meta.is_file() => meta,
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                return Err(error).with_context(|| format!("reading {}", target.path.display()));
+                return Err(error).with_context(|| format!("could not read {}", target.path.display()));
             }
             _ => continue, // Not downloaded yet.
         };
+        present += 1;
         let chunks = &target.entry.chunks;
         let found = Found { source: target.source(), len: meta.len(), modified: meta.modified().ok(),
                             good: vec![false; chunks.len()] };
@@ -250,6 +267,7 @@ fn check_files(targets: &[Target], previous: Option<&OnDisk>, progress: &Progres
                 && found.modified.is_some()
         });
         if let Some(old) = unchanged {
+            reused += 1;
             let size: u64 = chunks.iter().zip(&old.good).filter(|(_, good)| **good).map(|(c, _)| u64::from(c.size)).sum();
             progress.done.fetch_add(size, Relaxed);
             on_disk.files.insert(target.path.clone(), old.clone());
@@ -262,6 +280,9 @@ fn check_files(targets: &[Target], previous: Option<&OnDisk>, progress: &Progres
 
     // Disks are slow with many readers at once, so use a few threads.
     let threads = thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    log::write(format!("check: {} files, {present} on disk, {reused} of those unchanged since the last check \
+                        ({} files known from it); reading {} chunks with {threads} threads", targets.len(),
+                       previous.map_or(0, |previous| previous.files.len()), queue.len()));
     let next = AtomicUsize::new(0);
     let matched = thread::scope(|scope| {
         let workers: Vec<_> = (0..threads).map(|_| scope.spawn(|| -> Result<Vec<(usize, usize)>> {
@@ -271,7 +292,7 @@ fn check_files(targets: &[Target], previous: Option<&OnDisk>, progress: &Progres
                 let (path, chunk) = (&targets[t].path, &targets[t].entry.chunks[c]);
                 buffer.resize(chunk.size as usize, 0);
                 File::open(path).and_then(|file| read_at(&file, &mut buffer, chunk.offset))
-                    .with_context(|| format!("reading {}", path.display()))?;
+                    .with_context(|| format!("could not read {}", path.display()))?;
                 if Sha1::digest(&buffer)[..] == chunk.sha {
                     progress.done.fetch_add(chunk.size.into(), Relaxed);
                     matched.push((t, c));
@@ -281,9 +302,13 @@ fn check_files(targets: &[Target], previous: Option<&OnDisk>, progress: &Progres
         })).collect();
         workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Result<Vec<_>>>()
     })?;
+    let seconds = started.elapsed().as_secs_f64();
     if progress.stop.load(Relaxed) {
+        log::write(format!("check: stopped after {seconds:.3}s"));
         return Ok(None);
     }
+    log::write(format!("check: {} of {} chunks read match; {} bytes already there; {seconds:.3}s",
+                       matched.iter().map(Vec::len).sum::<usize>(), queue.len(), progress.done.load(Relaxed)));
     for (t, c) in matched.into_iter().flatten() {
         on_disk.add(&targets[t], c);
     }
@@ -324,6 +349,8 @@ struct Work<'a> {
     next: AtomicUsize,
     failed: AtomicUsize,
     fatal: Mutex<Option<anyhow::Error>>,
+    /// When the progress was last logged.
+    reported: Mutex<Instant>,
     agent: &'a ureq::Agent,
     servers: &'a [String],
     progress: &'a Progress,
@@ -335,9 +362,11 @@ pub fn download(package: &Package, output: &Path, jobs: usize, agent: &ureq::Age
                 previous: Option<&OnDisk>, progress: &Progress) -> Result<Summary> {
     ensure!(!servers.is_empty(), "no content servers");
     let (folders, targets) = plan(package, output)?;
+    log::write(format!("download: {output:?}, {} folders, {} files, {jobs} workers, {} servers",
+                       folders.len(), targets.len(), servers.len()));
     let parents = targets.iter().filter_map(|target| target.path.parent());
     for folder in folders.iter().map(PathBuf::as_path).chain(parents) {
-        fs::create_dir_all(folder).with_context(|| format!("creating {}", folder.display()))?;
+        fs::create_dir_all(folder).with_context(|| format!("could not create the folder {}", folder.display()))?;
     }
     let mut summary = Summary {
         files: targets.len(),
@@ -362,13 +391,15 @@ pub fn download(package: &Package, output: &Path, jobs: usize, agent: &ureq::Age
         .filter(|&(t, c)| !on_disk.is_good(&targets[t].path, c))
         .collect();
     summary.reused = targets.iter().map(|target| target.entry.chunks.len()).sum::<usize>() - queue.len();
+    let to_fetch: u64 = queue.iter().map(|&(t, c)| u64::from(targets[t].entry.chunks[c].size)).sum();
+    log::write(format!("download: {} chunks to fetch ({to_fetch} bytes), {} already on disk", queue.len(), summary.reused));
     let mut slots: Vec<Slot> = targets.iter().map(|_| Slot::default()).collect();
     for &(t, _) in &queue {
         *slots[t].remaining.get_mut() += 1;
     }
     let work = Work {
         targets: &targets, slots, queue, next: AtomicUsize::new(0), failed: AtomicUsize::new(0),
-        fatal: Mutex::new(None), agent, servers, progress,
+        fatal: Mutex::new(None), reported: Mutex::new(Instant::now()), agent, servers, progress,
     };
     let fetching = Instant::now();
     let written: Vec<(usize, usize)> = thread::scope(|scope| {
@@ -378,12 +409,15 @@ pub fn download(package: &Package, output: &Path, jobs: usize, agent: &ureq::Age
     });
     let fetch_time = fetching.elapsed();
     drop(work.slots); // Close the files of chunks left unfinished.
+    log::write(format!("download: workers done after {:.3}s; {} chunks written, {} failed, {} bytes received, stop {}",
+                       fetch_time.as_secs_f64(), written.len(), work.failed.load(Relaxed),
+                       progress.received.load(Relaxed), progress.stop.load(Relaxed)));
 
     if let Some(error) = work.fatal.into_inner().unwrap() {
         return Err(error);
     }
     let failed = work.failed.into_inner();
-    ensure!(failed == 0, "{failed} chunks could not be downloaded. Run again to retry them.");
+    ensure!(failed == 0, "{failed} chunks could not be downloaded; try again to fetch them");
     summary.fetched = written.len();
     let mut touched = HashSet::new();
     for (t, c) in written {
@@ -393,13 +427,14 @@ pub fn download(package: &Package, output: &Path, jobs: usize, agent: &ureq::Age
     let paused = progress.stop.load(Relaxed);
     if !paused {
         for (t, target) in targets.iter().enumerate() {
-            if tidy(target).with_context(|| format!("finishing {}", target.path.display()))? {
+            if tidy(target).with_context(|| format!("could not finish {}", target.path.display()))? {
+                log::write(format!("download: cut {:?} to {} bytes", target.path, target.entry.size));
                 touched.insert(t);
             }
         }
     }
     for t in touched {
-        on_disk.restat(&targets[t].path).with_context(|| format!("reading {}", targets[t].path.display()))?;
+        on_disk.restat(&targets[t].path).with_context(|| format!("could not read {}", targets[t].path.display()))?;
     }
     summary.on_disk = Some(on_disk);
     if paused {
@@ -443,27 +478,44 @@ impl Work<'_> {
         while !self.progress.stop.load(Relaxed) {
             let Some(&(t, c)) = self.queue.get(self.next.fetch_add(1, Relaxed)) else { break };
             let (target, chunk) = (&self.targets[t], &self.targets[t].entry.chunks[c]);
-            match self.fetch(target.depot, chunk, &mut server) {
+            match self.fetch(target, chunk, &mut server) {
                 Ok(plain) => match self.slots[t].write(&target.path, &plain, chunk.offset) {
                     Ok(()) => {
                         self.progress.done.fetch_add(chunk.size.into(), Relaxed);
                         self.progress.fetched.fetch_add(chunk.size.into(), Relaxed);
                         written.push((t, c));
                     }
-                    Err(error) => self.abort(anyhow!(error).context(target.path.display().to_string())),
+                    Err(error) => {
+                        self.abort(anyhow!(error).context(format!("could not write {}", target.path.display())));
+                    }
                 },
                 Err(_) if self.progress.stop.load(Relaxed) => {}
                 Err(error) => {
                     let failed = self.failed.fetch_add(1, Relaxed) + 1;
                     self.progress.log(format!("Chunk of {:?} failed: {error:#}", target.entry.name));
                     if failed >= MAX_FAILURES {
-                        self.abort(anyhow!("giving up after {failed} failed chunks; last error: {error:#}"));
+                        self.abort(error.context(format!("giving up after {failed} chunks failed to download")));
                     }
                 }
             }
             self.slots[t].finish_chunk();
+            self.report();
         }
         written
+    }
+
+    /// Log how far the download has got, if it has not been logged lately.
+    fn report(&self) {
+        let Ok(mut reported) = self.reported.try_lock() else { return };
+        if reported.elapsed() < REPORT_EVERY {
+            return;
+        }
+        *reported = Instant::now();
+        let progress = self.progress;
+        log::write(format!("download: {} of {} bytes done, {} fetched, {} received; {} of {} chunks started, {} failed",
+                           progress.done.load(Relaxed), progress.total.load(Relaxed), progress.fetched.load(Relaxed),
+                           progress.received.load(Relaxed), self.next.load(Relaxed).min(self.queue.len()),
+                           self.queue.len(), self.failed.load(Relaxed)));
     }
 
     fn abort(&self, error: anyhow::Error) {
@@ -472,7 +524,8 @@ impl Work<'_> {
     }
 
     /// Try each server in turn, three rounds, backing off between rounds.
-    fn fetch(&self, depot: &Depot, chunk: &Chunk, server: &mut usize) -> Result<Vec<u8>> {
+    fn fetch(&self, target: &Target, chunk: &Chunk, server: &mut usize) -> Result<Vec<u8>> {
+        let depot = target.depot;
         let sha: String = chunk.sha.iter().map(|b| format!("{b:02x}")).collect();
         let mut error = anyhow!("no servers");
         for round in 0..3 {
@@ -484,6 +537,7 @@ impl Work<'_> {
                     bail!("stopped");
                 }
                 let url = format!("{}/depot/{}/chunk/{sha}", self.servers[*server % self.servers.len()], depot.id);
+                let attempt = Instant::now();
                 let result = self.agent.get(&url).call()
                     .and_then(|mut response| response.body_mut().with_config().limit(64 << 20).read_to_vec())
                     .inspect(|data| _ = self.progress.received.fetch_add(data.len() as u64, Relaxed))
@@ -492,6 +546,8 @@ impl Work<'_> {
                 match result {
                     Ok(plain) => return Ok(plain),
                     Err(e) => {
+                        log::write(format!("chunk failed: {url} ({:?} at {}, {} bytes), round {round}, after {} ms: {e:#}",
+                                           target.entry.name, chunk.offset, chunk.size, attempt.elapsed().as_millis()));
                         error = e;
                         *server += 1;
                     }
@@ -575,6 +631,11 @@ pub fn duration(seconds: u64) -> String {
         60..3600 => format!("{}m {:02}s", seconds / 60, seconds % 60),
         _ => format!("{}h {:02}m", seconds / 3600, seconds % 3600 / 60),
     }
+}
+
+/// `YYYY-MM-DD HH:MM:SS UTC` for a Unix time.
+pub fn datetime(unix: u64) -> String {
+    format!("{} {:02}:{:02}:{:02} UTC", date(unix), unix / 3600 % 24, unix / 60 % 60, unix % 60)
 }
 
 /// `YYYY-MM-DD` (UTC) for a Unix time.

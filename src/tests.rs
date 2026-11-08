@@ -298,10 +298,45 @@ fn reads_keys_and_names_from_lua() {
 }
 
 #[test]
+fn gives_people_short_errors() {
+    use anyhow::Context;
+    let missing = fs::read(std::env::temp_dir().join("trashpanda-test-missing")).context("could not read the package");
+    assert_eq!(crate::log::brief(&missing.unwrap_err()), "Could not read the package: it does not exist");
+    let refused = anyhow::Error::from(ureq::Error::StatusCode(404)).context("giving up after 20 chunks failed");
+    assert_eq!(crate::log::brief(&refused), "Giving up after 20 chunks failed: the server answered with error 404");
+    let plain = anyhow::anyhow!("the package is not a zip file");
+    assert_eq!(crate::log::brief(&plain), "The package is not a zip file");
+}
+
+#[test]
+fn keeps_the_log_small() {
+    let mut log = crate::log::Log::default();
+    for n in 0..100 {
+        log.push(n.to_string(), 40);
+    }
+    // Past 40 lines, ten at a time are dropped after the first four.
+    let lines = log.lines();
+    assert_eq!(lines[..4], ["0", "1", "2", "3"]);
+    assert_eq!(lines[4].trim(), "(60 lines dropped here to keep the log small)");
+    assert_eq!(lines[5..], (64..100).map(|n| n.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn keeps_keys_out_of_the_log() {
+    let key = "4ee20016788a1b4d0a2fca7538249558728be0b90e5c064c412a68dfa2c541e7";
+    let line = format!("addappid(2862861, 1, \"{key}\") -- Depot 2862861");
+    assert_eq!(crate::log::redact_keys(&line), "addappid(2862861, 1, \"<key>\") -- Depot 2862861");
+    let manifest = "setManifestid(2862861, \"6952845047153854805\", 32501641497)";
+    assert_eq!(crate::log::redact_keys(manifest), manifest);
+    assert_eq!(crate::log::clip("née", 2), "n");
+}
+
+#[test]
 fn formats_dates() {
     for (time, date) in [(0, "1970-01-01"), (951_782_400, "2000-02-29"), (1_794_069_781, "2026-11-07")] {
         assert_eq!(download::date(time), date);
     }
+    assert_eq!(download::datetime(1_794_069_781), "2026-11-07 16:43:01 UTC");
 }
 
 #[test]
@@ -363,6 +398,9 @@ fn downloads_resumes_and_repairs() {
                                       ("99_1.manifest", &manifest_for_depot(99))])).unwrap();
     let mut package = depot::read_package(&package_path).unwrap();
     assert_eq!(package.warnings.len(), 1, "the manifest without a key is skipped");
+    let logged = crate::log::lines().join("\n");
+    assert!(logged.contains("lua| addappid(123, 1, \"<key>\") -- Depot 123"), "{logged}");
+    assert!(!logged.contains(&hex(&KEY)), "the log must not hold depot keys");
     assert_eq!(download::describe(&package), [
         "App 2862860: the app",
         "Depot 123 (manifest 9876543210123456789, 2026-11-07): 2 files, 19.3 KiB",
@@ -422,7 +460,7 @@ fn downloads_resumes_and_repairs() {
 
     package.depots[1].entries.push(depot::Entry { name: "empty-file".into(), size: 0, flags: 0, chunks: Vec::new() });
     let error = download::download(&package, &output, 2, &agent, &servers, None, &Progress::default()).unwrap_err();
-    assert!(error.to_string().contains("is in both depot 123 and depot 98"), "{error}");
+    assert!(error.to_string().contains("depots 123 and 98 both contain \"empty-file\""), "{error}");
     // Leaving one of the two depots out avoids the clash.
     let only = package.select(|id| id == 123);
     assert_eq!(only.depots.len(), 1);

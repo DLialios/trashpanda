@@ -9,6 +9,8 @@ use aes::cipher::{BlockCipherDecrypt, BlockModeDecrypt, KeyInit, KeyIvInit};
 use anyhow::{Context, Result, bail, ensure};
 use sha1::{Digest, Sha1};
 
+use crate::log;
+
 /// Largest chunk accepted from a manifest. Steam uses chunks of at most 1 MiB.
 const MAX_CHUNK: u32 = 32 << 20;
 #[cfg(unix)]
@@ -105,36 +107,51 @@ pub struct Lua {
 /// Read a package zip holding a `.lua` file with depot keys and the
 /// depots' `.manifest` files.
 pub fn read_package(path: &Path) -> Result<Package> {
-    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut archive = zip::ZipArchive::new(Cursor::new(data)).context("package is not a zip file")?;
+    log::write(format!("package: reading {path:?}"));
+    let data = std::fs::read(path).context("could not read the package")?;
+    log::write(format!("package: {} bytes", data.len()));
+    let mut archive = zip::ZipArchive::new(Cursor::new(data)).context("the package is not a zip file")?;
     let mut lua = String::new();
     let mut manifests = Vec::new();
     for index in 0..archive.len() {
-        let mut item = archive.by_index(index)?;
-        let name = item.name()?.to_ascii_lowercase();
+        let mut item = archive.by_index(index).context("the package zip is damaged")?;
+        let name = item.name().context("the package zip is damaged")?.to_ascii_lowercase();
+        log::write(format!("package: entry {name:?}, {} bytes", item.size()));
+        let unreadable = || format!("could not read {name} in the package");
         if name.ends_with(".lua") {
-            item.read_to_string(&mut lua).with_context(|| format!("reading {name}"))?;
+            item.read_to_string(&mut lua).with_context(unreadable)?;
             lua.push('\n');
         } else if name.ends_with(".manifest") {
             let mut bytes = Vec::new();
-            item.read_to_end(&mut bytes)?;
+            item.read_to_end(&mut bytes).with_context(unreadable)?;
             manifests.push((name, bytes));
         }
     }
+    for line in lua.lines() {
+        log::write(format!("lua| {}", log::redact_keys(line)));
+    }
     let mut lua = parse_lua(&lua);
+    let mut keyed: Vec<_> = lua.keys.keys().collect();
+    keyed.sort();
+    log::write(format!("lua: app {:?}, name {:?}, build {:?}, keys for depots {keyed:?}",
+                       lua.app, lua.app_name, lua.build));
     let mut package = Package { app: lua.app, app_name: lua.app_name, build: lua.build, ..Package::default() };
     for (name, bytes) in manifests {
+        log::write(format!("package: parsing {name}"));
         let depot = parse_manifest(&bytes, &lua.keys, &mut package.warnings)
-            .with_context(|| format!("manifest {name}"))?;
+            .with_context(|| format!("{name} in the package is not a valid manifest"))?;
         match depot {
             Some(depot) if package.depots.iter().any(|d| d.id == depot.id) => {
-                bail!("package has more than one manifest for depot {}", depot.id)
+                bail!("the package has more than one manifest for depot {}", depot.id)
             }
             Some(depot) => package.depots.push(Depot { name: lua.names.remove(&depot.id), ..depot }),
             None => package.warnings.push(format!("Skipping {name}: no key for its depot")),
         }
     }
-    ensure!(!package.depots.is_empty(), "package contains no manifests with a matching depot key");
+    for warning in &package.warnings {
+        log::write(format!("package: warning: {warning}"));
+    }
+    ensure!(!package.depots.is_empty(), "the package has no manifests with a matching depot key");
     Ok(package)
 }
 
@@ -248,9 +265,10 @@ fn field<'a>(fields: &'a [(u32, Value<'a>)], number: u32) -> Option<&'a Value<'a
 /// Parse a raw or ZIP-wrapped manifest. Returns `None` when `keys` has no
 /// key for the manifest's depot. Symbolic links are skipped with a warning.
 pub fn parse_manifest(data: &[u8], keys: &HashMap<u32, Key>, warnings: &mut Vec<String>) -> Result<Option<Depot>> {
+    let zipped = data.starts_with(b"PK");
     let unzipped;
     let mut data = data;
-    if data.starts_with(b"PK") {
+    if zipped {
         unzipped = unzip(data, None)?;
         data = &unzipped;
     }
@@ -276,6 +294,8 @@ pub fn parse_manifest(data: &[u8], keys: &HashMap<u32, Key>, warnings: &mut Vec<
     let manifest = field(&metadata, 2).map_or(0, Value::int);
     let created = field(&metadata, 3).map(Value::int).filter(|&time| time != 0);
     let encrypted_names = field(&metadata, 4).is_some_and(|v| v.int() != 0);
+    log::write(format!("manifest: depot {depot}, manifest {manifest}, created {created:?}, \
+                        encrypted names {encrypted_names}, zipped {zipped}"));
     let Some(&key) = keys.get(&depot) else { return Ok(None) };
 
     let mut entries = Vec::new();
@@ -322,6 +342,10 @@ pub fn parse_manifest(data: &[u8], keys: &HashMap<u32, Key>, warnings: &mut Vec<
         }
         entries.push(entry);
     }
+    let chunks: usize = entries.iter().map(|entry| entry.chunks.len()).sum();
+    let size: u64 = entries.iter().map(|entry| entry.size).sum();
+    log::write(format!("manifest: depot {depot}: {} entries ({} folders), {chunks} chunks, {size} bytes",
+                       entries.len(), entries.iter().filter(|entry| entry.is_dir()).count()));
     Ok(Some(Depot { id: depot, manifest, created, name: None, key, entries }))
 }
 
