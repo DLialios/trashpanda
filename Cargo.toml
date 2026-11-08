@@ -1,0 +1,25 @@
+[package]
+name = "rin-dl"
+version = "0.1.0"
+edition = "2024"
+description = "Download Steam depots from a manifest package, with resume"
+
+[dependencies]
+aes = "0.9.4"
+anyhow = "1.0"
+cbc = { version = "0.2.1", features = ["alloc"] }
+crc32fast = "1.5.4"
+eframe = "0.37.0"
+lzma-rs = "0.3.0"
+rfd = "0.18.0"
+ruzstd = "0.9.1"
+serde_json = "1.0.154"
+sha1 = "0.11.0"
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+zip = { version = "9.4.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
+[profile.release]
+strip = true
