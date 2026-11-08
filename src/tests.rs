@@ -16,7 +16,7 @@ use sha1::{Digest, Sha1};
 
 use crate::depot::{self, Key};
 use crate::download::{self, Meter, Progress, Rates};
-use crate::update;
+use crate::{installed, update};
 
 const KEY: Key = [7; 32];
 const IV: [u8; 16] = [9; 16];
@@ -341,7 +341,8 @@ fn formats_dates() {
 
 #[test]
 fn rejects_unsafe_paths() {
-    for name in ["../outside", "/outside", "C:/outside", "x/../../outside", "", ".", "x\0y", "a//b", "a/. ./b"] {
+    for name in ["../outside", "/outside", "C:/outside", "x/../../outside", "", ".", "x\0y", "a//b", "a/. ./b",
+                 "x\\..\\..\\outside"] {
         assert!(depot::check_name(name).is_err(), "{name:?}");
     }
     depot::check_name("folder/game.bin").unwrap();
@@ -505,6 +506,231 @@ fn failed_chunks_are_reported_and_retried_on_the_next_run() {
     let summary = download::download(&package, &temp.0, 1, &agent, &servers, None, &Progress::default()).unwrap();
     assert_eq!((summary.fetched, summary.reused, summary.paused), (1, 2, false));
     assert_eq!(fs::read(temp.0.join("game.bin")).unwrap(), fixture.data);
+}
+
+/// A server that takes every connection and request and never answers, like
+/// a content server that has hung.
+fn silent() -> Server {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let log = requests.clone();
+    thread::spawn(move || {
+        let mut open = Vec::new();
+        for stream in listener.incoming() {
+            log.lock().unwrap().push(String::new());
+            open.push(stream.unwrap()); // Held open, never answered.
+        }
+    });
+    Server { url, requests }
+}
+
+#[test]
+fn a_server_that_never_answers_holds_nothing_up() {
+    let fixture = fixture();
+    let temp = TempDir::new("silent");
+    let package = depot::Package {
+        depots: vec![depot::parse_manifest(&manifest(&[fixture.mapping(b"game.bin")], false),
+                                           &HashMap::from([(123, KEY)]), &mut Vec::new()).unwrap().unwrap()],
+        ..Default::default()
+    };
+    let (silent, good) = (silent(), serve(&fixture.responses, false));
+    let agent = download::agent(1);
+
+    // The download gives up on it and moves on to the next server.
+    let started = Instant::now();
+    let servers = [silent.url.clone(), good.url.clone()];
+    let summary = download::download(&package, &temp.0, 1, &agent, &servers, None, &Progress::default()).unwrap();
+    assert_eq!(summary.fetched, 3);
+    assert_eq!(silent.requests.lock().unwrap().len(), 1);
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+
+    // Pausing while a request hangs does not wait minutes for it.
+    fs::remove_file(temp.0.join("game.bin")).unwrap();
+    let (progress, servers) = (Progress::default(), [silent.url.clone()]);
+    let started = Instant::now();
+    let summary = thread::scope(|scope| {
+        let run = scope.spawn(|| download::download(&package, &temp.0, 1, &agent, &servers, None, &progress));
+        thread::sleep(Duration::from_millis(100));
+        progress.stop.store(true, Relaxed);
+        run.join().unwrap().unwrap()
+    });
+    assert!(summary.paused && summary.fetched == 0);
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+}
+
+/// A depot of `files`, each made of `parts`, one chunk per part, adding what
+/// a server answers for those chunks to `responses`.
+fn depot_of(id: u32, files: &[(&str, &[&[u8]])], responses: &mut HashMap<String, Vec<u8>>) -> depot::Depot {
+    let mappings: Vec<Vec<u8>> = files.iter().map(|(name, parts)| {
+        let size: usize = parts.iter().map(|part| part.len()).sum();
+        let mut mapping = [bytes(1, name.as_bytes()), int(2, size as u64), int(3, 0)].concat();
+        let mut offset = 0;
+        for part in *parts {
+            let sha = Sha1::digest(part);
+            mapping.extend(bytes(6, &[bytes(1, &sha), int(3, offset), int(4, part.len() as u64)].concat()));
+            responses.insert(hex(&sha), encrypt(&compressed(part, "zstd")));
+            offset += part.len() as u64;
+        }
+        mapping
+    }).collect();
+    let keys = HashMap::from([(123, KEY)]);
+    let mut depot = depot::parse_manifest(&manifest(&mappings, false), &keys, &mut Vec::new()).unwrap().unwrap();
+    depot.id = id;
+    depot
+}
+
+/// How many files a download said it removed.
+fn removed(progress: &Progress) -> usize {
+    let said = progress.lines(0);
+    said.iter().find_map(|line| line.strip_prefix("Removed ")?.split(' ').next()?.parse().ok()).unwrap_or(0)
+}
+
+fn listed(output: &Path) -> Vec<(u32, Vec<String>)> {
+    let installed = installed::Installed::load(output).unwrap();
+    installed.depots.into_iter().map(|(id, files)| (id, files.into_iter().collect())).collect()
+}
+
+#[test]
+fn updates_in_place_and_removes_what_the_new_version_dropped() {
+    let temp = TempDir::new("game-update");
+    let out = &temp.0;
+    let part = |text: &str, count: usize| text.repeat(count).into_bytes();
+    let (a, b, b2, c, f, g) = (part("aaaa\n", 900), part("bbbb\n", 700), part("BBBB\n", 700), part("cccc\n", 500),
+                               part("ffff\n", 400), part("gggg\n", 450));
+    let (new, readme, stale, gone) = (part("new\n", 200), part("read me\n", 50), part("old\n", 300), part("gone\n", 100));
+    let (fr, voice, subtitles) = (part("bonjour\n", 80), part("voix\n", 600), part("sous-titres\n", 90));
+    let mut responses = HashMap::new();
+    let game1 = depot_of(123, &[("game.bin", &[&a, &b, &c]), ("shrunk.bin", &[&f, &g]), ("Readme.txt", &[&readme]),
+                                ("old/stale.bin", &[&stale]), ("gone/away.bin", &[&gone])], &mut responses);
+    let french1 = depot_of(124, &[("lang/fr.txt", &[&fr]), ("lang/fr-voice.bin", &[&voice])], &mut responses);
+    // The next version changes one chunk, shortens a file, renames one by
+    // case, drops two, adds one, and moves fr.txt from the French depot.
+    let game2 = depot_of(123, &[("game.bin", &[&a, &b2, &c]), ("shrunk.bin", &[&f]), ("readme.txt", &[&readme]),
+                                ("new.bin", &[&new]), ("lang/fr.txt", &[&fr])], &mut responses);
+    let french2 = depot_of(124, &[("lang/fr-subtitles.txt", &[&subtitles])], &mut responses);
+    // And then fr.txt moves back.
+    let game3 = depot_of(123, &[("game.bin", &[&a, &b2, &c]), ("shrunk.bin", &[&f]), ("readme.txt", &[&readme]),
+                                ("new.bin", &[&new])], &mut responses);
+    let french3 = depot_of(124, &[("lang/fr.txt", &[&fr]), ("lang/fr-subtitles.txt", &[&subtitles])], &mut responses);
+    let server = serve(&responses, false);
+    let (agent, servers) = (download::agent(2), [server.url.clone()]);
+    let run = |depots: Vec<depot::Depot>| {
+        let (package, progress) = (depot::Package { depots, ..Default::default() }, Progress::default());
+        let summary = download::download(&package, out, 2, &agent, &servers, None, &progress).unwrap();
+        (summary.fetched, summary.reused, removed(&progress))
+    };
+    let read = |name: &str| fs::read(out.join(name)).unwrap();
+    let exists = |name: &str| out.join(name).exists();
+
+    // The player's own files, before and after the first download.
+    fs::create_dir_all(out.join("saves")).unwrap();
+    fs::write(out.join("saves/slot1.sav"), "mine").unwrap();
+    assert_eq!(run(vec![game1, french1]), (10, 0, 0));
+    fs::write(out.join("old/notes.txt"), "mine too").unwrap();
+    let game1_files = ["Readme.txt", "game.bin", "gone/away.bin", "old/stale.bin", "shrunk.bin"];
+    assert_eq!(listed(out), [(123, game1_files.map(String::from).to_vec()),
+                             (124, vec!["lang/fr-voice.bin".into(), "lang/fr.txt".into()])]);
+
+    // The new game depot alone, the French one left unticked: only the
+    // changed and new chunks are fetched, and what it dropped is removed.
+    assert_eq!(run(vec![game2.clone()]), (3, 4, 3));
+    assert_eq!((read("game.bin"), read("shrunk.bin"), read("new.bin")), ([&a[..], &b2, &c].concat(), f.clone(), new));
+    assert_eq!(read("readme.txt"), readme);
+    assert!(!exists("Readme.txt") && !exists("old/stale.bin") && !exists("gone"), "the folder emptied goes too");
+    assert_eq!((read("old/notes.txt"), read("saves/slot1.sav")), (b"mine too".to_vec(), b"mine".to_vec()));
+    assert_eq!(read("lang/fr-voice.bin"), voice, "a depot not downloaded keeps its files");
+    let game2_files = ["game.bin", "lang/fr.txt", "new.bin", "readme.txt", "shrunk.bin"].map(String::from).to_vec();
+    assert_eq!(listed(out)[0], (123, game2_files.clone()));
+
+    // Both: the French depot's dropped file goes, but not the one it gave the game.
+    let (fetched, _, removed) = run(vec![game2, french2]);
+    assert_eq!((fetched, removed), (1, 1));
+    assert!(!exists("lang/fr-voice.bin"));
+    assert_eq!((read("lang/fr.txt"), read("lang/fr-subtitles.txt")), (fr.clone(), subtitles));
+    assert_eq!(listed(out), [(123, game2_files), (124, vec!["lang/fr-subtitles.txt".into()])]);
+
+    // Each depot alone: the French one takes fr.txt back, so the game
+    // dropping it must leave it, as the French depot is not downloaded then.
+    assert_eq!(run(vec![french3]), (0, 2, 0));
+    assert_eq!(run(vec![game3]), (0, 6, 0));
+    assert_eq!(read("lang/fr.txt"), fr);
+}
+
+/// Makes a folder writable again when dropped, so that a test that fails
+/// while it is read-only still cleans up.
+#[cfg(unix)]
+struct Unlock(PathBuf);
+
+#[cfg(unix)]
+impl Drop for Unlock {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[test]
+fn an_edited_or_damaged_list_removes_nothing_it_should_not() {
+    let fixture = fixture();
+    let temp = TempDir::new("list");
+    let out = temp.0.join("out");
+    fs::create_dir_all(out.join("folder")).unwrap();
+    fs::create_dir_all(temp.0.join("outside")).unwrap();
+    fs::write(temp.0.join("outside.txt"), "keep").unwrap();
+    fs::write(temp.0.join("outside/a.txt"), "keep").unwrap();
+    let package = depot::Package {
+        depots: vec![depot::parse_manifest(&manifest(&[fixture.mapping(b"game.bin")], false),
+                                           &HashMap::from([(123, KEY)]), &mut Vec::new()).unwrap().unwrap()],
+        ..Default::default()
+    };
+    let server = serve(&fixture.responses, false);
+    let (agent, servers) = (download::agent(1), [server.url.clone()]);
+    let run = || {
+        let progress = Progress::default();
+        let summary = download::download(&package, &out, 1, &agent, &servers, None, &progress).unwrap();
+        assert_eq!(summary.fetched + summary.reused, 3);
+        (removed(&progress), progress.lines(0).join("\n"))
+    };
+    let mut names = vec!["../outside.txt".to_string(), temp.0.join("outside.txt").display().to_string(),
+                         "folder\\..\\..\\outside.txt".into(), "folder".into()];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(temp.0.join("outside"), out.join("link")).unwrap();
+        names.push("link/a.txt".into());
+        // A file that cannot be removed now stays listed, to be tried again.
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir(out.join("locked")).unwrap();
+        fs::write(out.join("locked/x.bin"), "old").unwrap();
+        fs::set_permissions(out.join("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+        names.push("locked/x.bin".into());
+    }
+    #[cfg(unix)]
+    let _unlock = Unlock(out.join("locked"));
+    fs::write(out.join(installed::FILE), serde_json::json!({ "depots": { "123": names } }).to_string()).unwrap();
+
+    let (removed, said) = run();
+    assert!(said.contains("Not removing \"../outside.txt\""), "{said}");
+    assert_eq!(fs::read(temp.0.join("outside.txt")).unwrap(), b"keep");
+    assert_eq!(fs::read(temp.0.join("outside/a.txt")).unwrap(), b"keep");
+    assert!(out.join("folder").is_dir());
+    #[cfg(unix)]
+    {
+        let stuck = out.join("locked/x.bin").exists(); // Removable all the same when tests run as root.
+        assert_eq!(removed, usize::from(!stuck));
+        let expected: Vec<String> = ["game.bin", "locked/x.bin"].into_iter().filter(|name| stuck || *name == "game.bin")
+            .map(String::from).collect();
+        assert_eq!(listed(&out), [(123, expected)]);
+    }
+    #[cfg(not(unix))]
+    assert_eq!((removed, listed(&out)), (0, vec![(123, vec!["game.bin".to_string()])]));
+
+    // A damaged list is replaced, removing nothing.
+    fs::write(out.join(installed::FILE), "{ not json").unwrap();
+    let (removed, said) = run();
+    assert_eq!(removed, 0);
+    assert!(said.contains("is damaged"), "{said}");
+    assert_eq!(listed(&out), [(123, vec!["game.bin".to_string()])]);
 }
 
 #[cfg(unix)]

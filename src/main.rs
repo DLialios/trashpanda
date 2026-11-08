@@ -4,6 +4,7 @@
 mod depot;
 mod download;
 mod gui;
+mod installed;
 mod log;
 #[cfg(test)]
 mod tests;
@@ -29,6 +30,9 @@ Usage: trashpanda PACKAGE.zip [-o DIR] [-j N] [-d ID,ID...] [-l] [--log FILE]
 Downloads every depot in PACKAGE.zip (a .lua file with depot keys plus the
 depots' .manifest files) into the current directory. Run it again to resume:
 chunks already on disk are checked and kept, so it also repairs damaged files.
+A package of a newer version updates the same directory in place, and removes
+the files the new version dropped; .trashpanda-installed.json lists the files
+this program put there, and nothing else is ever removed.
 
   -o, --output DIR      download into DIR instead of the current directory
   -j, --jobs N          parallel chunk downloads (default 16)

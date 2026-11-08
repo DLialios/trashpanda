@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use sha1::{Digest, Sha1};
 
 use crate::depot::{self, Chunk, Depot, Entry, Package};
-use crate::log;
+use crate::{installed, log};
 
 const SERVER_LIST: &str = "https://api.steampowered.com/IContentServerDirectoryService/\
                            GetServersForSteamPipe/v1/?cell_id=0&max_servers=20";
@@ -23,6 +23,10 @@ const SERVER_LIST: &str = "https://api.steampowered.com/IContentServerDirectoryS
 const MAX_FAILURES: usize = 20;
 /// Pause before the second round of retries; it doubles for the third.
 const RETRY_DELAY: Duration = Duration::from_millis(if cfg!(test) { 10 } else { 4000 });
+/// A server that takes longer than this to connect, or then goes this long
+/// without sending a byte, is given up on and the next one tried. Without
+/// it a hung connection held up the run, and a pause, for two minutes.
+const STALL: Duration = Duration::from_millis(if cfg!(test) { 1000 } else { 10_000 });
 /// How often a download logs how far it has got.
 const REPORT_EVERY: Duration = Duration::from_secs(15);
 
@@ -110,7 +114,8 @@ pub fn describe(package: &Package) -> Vec<String> {
 
 pub fn agent(jobs: usize) -> ureq::Agent {
     ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_connect(Some(STALL))
+        .timeout_per_read(Some(STALL))
         .timeout_global(Some(Duration::from_secs(120)))
         .user_agent(concat!("trashpanda/", env!("CARGO_PKG_VERSION")))
         .max_idle_connections(jobs * 4)
@@ -364,9 +369,16 @@ pub fn download(package: &Package, output: &Path, jobs: usize, agent: &ureq::Age
     let (folders, targets) = plan(package, output)?;
     log::write(format!("download: {output:?}, {} folders, {} files, {jobs} workers, {} servers",
                        folders.len(), targets.len(), servers.len()));
+    let create = |folder: &Path| {
+        fs::create_dir_all(folder).with_context(|| format!("could not create the folder {}", folder.display()))
+    };
+    create(output)?;
+    progress.log(format!("Output: {}", output.display()));
+    // Before the new folders are made: one may be where an old file is.
+    installed::update(output, package, progress)?;
     let parents = targets.iter().filter_map(|target| target.path.parent());
     for folder in folders.iter().map(PathBuf::as_path).chain(parents) {
-        fs::create_dir_all(folder).with_context(|| format!("could not create the folder {}", folder.display()))?;
+        create(folder)?;
     }
     let mut summary = Summary {
         files: targets.len(),
@@ -374,7 +386,6 @@ pub fn download(package: &Package, output: &Path, jobs: usize, agent: &ureq::Age
         ..Summary::default()
     };
     progress.total.store(summary.bytes, Relaxed);
-    progress.log(format!("Output: {}", output.display()));
     let started = Instant::now();
 
     let Some(mut on_disk) = check_files(&targets, previous, progress)? else {
@@ -523,6 +534,18 @@ impl Work<'_> {
         self.progress.stop.store(true, Relaxed);
     }
 
+    /// Sleep for `delay`, but wake as soon as the run is stopped.
+    fn wait(&self, delay: Duration) {
+        let until = Instant::now() + delay;
+        while !self.progress.stop.load(Relaxed) {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            thread::sleep(left.min(Duration::from_millis(100)));
+        }
+    }
+
     /// Try each server in turn, three rounds, backing off between rounds.
     fn fetch(&self, target: &Target, chunk: &Chunk, server: &mut usize) -> Result<Vec<u8>> {
         let depot = target.depot;
@@ -530,7 +553,7 @@ impl Work<'_> {
         let mut error = anyhow!("no servers");
         for round in 0..3 {
             if round > 0 {
-                thread::sleep(RETRY_DELAY * round);
+                self.wait(RETRY_DELAY * round);
             }
             for _ in 0..self.servers.len() {
                 if self.progress.stop.load(Relaxed) {
@@ -559,7 +582,7 @@ impl Work<'_> {
 }
 
 /// The output path for a manifest entry, refusing paths through symlinks.
-fn destination(root: &Path, name: &str) -> Result<PathBuf> {
+pub fn destination(root: &Path, name: &str) -> Result<PathBuf> {
     depot::check_name(name)?;
     let mut path = root.to_path_buf();
     for part in name.split('/') {

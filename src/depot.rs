@@ -351,7 +351,9 @@ pub fn parse_manifest(data: &[u8], keys: &HashMap<u32, Key>, warnings: &mut Vec<
 
 /// Reject manifest paths that could escape the output directory.
 pub fn check_name(name: &str) -> Result<()> {
-    let bad_part = |part: &str| part.trim_end_matches([' ', '.']).is_empty() || part.contains([':', '\0']);
+    // Manifest names have `/` by now, so a backslash can only be an attempt
+    // to climb out on Windows, for example from an edited list of installed files.
+    let bad_part = |part: &str| part.trim_end_matches([' ', '.']).is_empty() || part.contains([':', '\0', '\\']);
     ensure!(!name.starts_with('/') && !name.split('/').any(bad_part), "unsafe path in manifest: {name:?}");
     Ok(())
 }
