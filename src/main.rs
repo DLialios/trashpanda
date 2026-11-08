@@ -6,6 +6,7 @@ mod download;
 mod gui;
 #[cfg(test)]
 mod tests;
+mod update;
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -21,7 +22,8 @@ pub const DEFAULT_JOBS: usize = 16;
 
 const USAGE: &str = "\
 Usage: trashpanda PACKAGE.zip [-o DIR] [-j N] [-d ID,ID...] [-l]
-       trashpanda        (opens the window)
+       trashpanda           (opens the window)
+       trashpanda --update  (replaces this program with the newest release)
 
 Downloads every depot in PACKAGE.zip (a .lua file with depot keys plus the
 depots' .manifest files) into the current directory. Run it again to resume:
@@ -48,6 +50,7 @@ fn main() -> ExitCode {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
+            Some("--update") => return self_update(),
             Some("-o" | "--output") => match args.next() {
                 Some(dir) => output = Some(PathBuf::from(dir)),
                 None => return fail("--output needs a directory"),
@@ -96,6 +99,27 @@ fn main() -> ExitCode {
 fn fail(message: &str) -> ExitCode {
     eprintln!("Error: {message}");
     ExitCode::FAILURE
+}
+
+/// Replace this program with the newest release, if there is a newer one.
+fn self_update() -> ExitCode {
+    let updater = update::Updater::new();
+    let release = match updater.check() {
+        Ok(Some(release)) => release,
+        Ok(None) => {
+            println!("trashpanda {} is the newest version.", update::current());
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => return fail(&format!("{error:#}")),
+    };
+    eprintln!("Updating from {} to {}…", update::current(), release.version);
+    match updater.install(&release) {
+        Ok(_) => {
+            println!("Updated to {}.", release.version);
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(&format!("{error:#}")),
+    }
 }
 
 /// Run the download on a thread and draw a progress bar on stderr.

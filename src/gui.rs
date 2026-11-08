@@ -12,6 +12,7 @@ use eframe::egui;
 
 use crate::depot::{self, Package};
 use crate::download::{self, Meter, OnDisk, Progress};
+use crate::update::{self, Release, Unwritable, Updater, Version};
 
 const TITLE: &str = "Trash Panda";
 
@@ -23,7 +24,11 @@ pub fn run() -> eframe::Result {
             .with_drag_and_drop(true),
         ..Default::default()
     };
-    eframe::run_native(TITLE, options, Box::new(|_| Ok(Box::new(App::default()))))
+    eframe::run_native(TITLE, options, Box::new(|_| {
+        let mut app = App::default();
+        app.check_for_update(true);
+        Ok(Box::new(app))
+    }))
 }
 
 /// What is chosen: the package path and output folder as typed, and the
@@ -50,6 +55,23 @@ struct App {
     progress: Arc<Progress>,
     meter: Meter,
     task: Option<Task>,
+    update: Update,
+}
+
+/// Checking for a newer version, and installing it.
+enum Update {
+    /// Not checked yet, or a quiet check found nothing worth showing.
+    Idle,
+    /// A quiet check, made when the window opens, shows only a newer version.
+    Checking { quiet: bool, job: JoinHandle<anyhow::Result<Option<Release>>> },
+    Current,
+    Available(Release),
+    Installing { version: Version, job: JoinHandle<anyhow::Result<PathBuf>> },
+    /// The new version is installed and started; this window is closing.
+    Restarting,
+    /// What went wrong, and the release page if the update has to be
+    /// downloaded by hand.
+    Failed { message: String, page: Option<String> },
 }
 
 /// A check or a download running on its own thread.
@@ -73,6 +95,7 @@ impl Default for App {
             progress: Arc::default(),
             meter: Meter::default(),
             task: None,
+            update: Update::Idle,
         }
     }
 }
@@ -171,12 +194,94 @@ impl App {
             }
         }
     }
+
+    fn check_for_update(&mut self, quiet: bool) {
+        self.update = Update::Checking { quiet, job: thread::spawn(|| Updater::new().check()) };
+    }
+
+    fn install_update(&mut self, release: Release) {
+        let version = release.version;
+        self.update = Update::Installing { version, job: thread::spawn(move || Updater::new().install(&release)) };
+    }
+
+    /// Take the result of a finished update check or install. After an
+    /// install, start the new version and close this window.
+    fn collect_update(&mut self, ctx: &egui::Context) {
+        let failed = |message: String| Update::Failed { message, page: None };
+        self.update = match std::mem::replace(&mut self.update, Update::Idle) {
+            Update::Checking { quiet, job } if job.is_finished() => match job.join() {
+                Ok(Ok(Some(release))) => Update::Available(release),
+                Ok(Ok(None)) if !quiet => Update::Current,
+                Ok(Err(error)) if !quiet => failed(format!("{error:#}")),
+                Err(_) if !quiet => failed("The update check crashed".into()),
+                _ => Update::Idle,
+            },
+            Update::Installing { version, job } if job.is_finished() => match job.join() {
+                Ok(Ok(exe)) => match update::restart(&exe) {
+                    Ok(()) => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        Update::Restarting
+                    }
+                    Err(error) => failed(format!("Updated to {version}, but could not start it ({error}). \
+                                                  Close this window and start it again.")),
+                },
+                Ok(Err(error)) => {
+                    let page = error.downcast_ref::<Unwritable>().map(|unwritable| unwritable.page.clone());
+                    Update::Failed { message: format!("{error:#}"), page }
+                }
+                Err(_) => failed("The update crashed".into()),
+            },
+            state => state,
+        };
+    }
+
+    /// The update button and what it found, laid out right to left.
+    fn update_controls(&mut self, ui: &mut egui::Ui, downloading: bool) {
+        match &mut self.update {
+            Update::Checking { quiet: false, .. } => {
+                ui.label("Checking for updates…");
+                ui.spinner();
+            }
+            Update::Available(release) => {
+                let release = release.clone();
+                let button = ui.add_enabled(!downloading, egui::Button::new("Update"));
+                if button.on_disabled_hover_text("Pause the download first; Resume continues it afterwards").clicked() {
+                    self.install_update(release.clone());
+                }
+                if downloading {
+                    ui.weak("Pause to update");
+                }
+                ui.hyperlink_to(format!("Version {} is available", release.version), &release.page)
+                    .on_hover_text("What is new in it");
+            }
+            Update::Installing { version, .. } => {
+                ui.label(format!("Updating to {version}…"));
+                ui.spinner();
+            }
+            Update::Restarting => {
+                ui.label("Restarting…");
+            }
+            Update::Idle | Update::Current | Update::Failed { .. } | Update::Checking { quiet: true, .. } => {
+                if ui.button("Check for updates").clicked() {
+                    match &mut self.update {
+                        Update::Checking { quiet, .. } => *quiet = false, // Show the quiet check instead.
+                        _ => self.check_for_update(false),
+                    }
+                }
+                if matches!(self.update, Update::Current) {
+                    ui.weak("Up to date");
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.collect();
+        self.collect_update(ui.ctx());
         let downloading = self.task.as_ref().is_some_and(|task| task.download);
+        let updating = matches!(self.update, Update::Installing { .. } | Update::Restarting);
         let dropped = ui.input(|input| input.raw.dropped_files.first().map(|file| file.path().to_path_buf()));
         if let (false, Some(path)) = (downloading, dropped) {
             self.package = path.display().to_string();
@@ -189,7 +294,18 @@ impl eframe::App for App {
             ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 0.0), row, |ui| {
                 ui.label(egui::RichText::new(TITLE).size(30.0).italics().strong());
                 ui.label(egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.update_controls(ui, downloading);
+                });
             });
+            if let Update::Failed { message, page } = &self.update {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(ui.visuals().error_fg_color, message);
+                    if let Some(page) = page {
+                        ui.hyperlink_to("Release page", page);
+                    }
+                });
+            }
             ui.separator();
             ui.add_enabled_ui(!downloading, |ui| {
                 ui.label("Package (.zip with a .lua and .manifest files; you can drop it on the window)");
@@ -226,7 +342,7 @@ impl eframe::App for App {
                         _ => "Download",
                     };
                     let wanted = |package: Arc<Package>| package.depots.iter().any(|depot| !self.skip.contains(&depot.id));
-                    let ready = !checking && self.parsed().is_some_and(wanted);
+                    let ready = !checking && !updating && self.parsed().is_some_and(wanted);
                     if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
                         self.start();
                     }
@@ -266,7 +382,7 @@ impl eframe::App for App {
                 }
             });
         });
-        if self.task.is_some() {
+        if self.task.is_some() || matches!(self.update, Update::Checking { .. } | Update::Installing { .. }) {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
     }

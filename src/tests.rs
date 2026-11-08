@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -16,6 +16,7 @@ use sha1::{Digest, Sha1};
 
 use crate::depot::{self, Key};
 use crate::download::{self, Meter, Progress, Rates};
+use crate::update;
 
 const KEY: Key = [7; 32];
 const IV: [u8; 16] = [9; 16];
@@ -135,20 +136,36 @@ impl Drop for TempDir {
     }
 }
 
-/// A local HTTP server serving `responses` by chunk SHA-1, or 503 for everything.
+/// A local HTTP server, and the paths requested from it.
 struct Server {
     url: String,
     requests: Arc<Mutex<Vec<String>>>,
 }
 
+/// What a test server answers a request with.
+enum Reply {
+    Body(&'static str, Vec<u8>),
+    Redirect(String),
+}
+
+/// A server serving `responses` by chunk SHA-1, or 503 for everything.
 fn serve(responses: &HashMap<String, Vec<u8>>, broken: bool) -> Server {
+    let responses = responses.clone();
+    serve_with(move |path| match responses.get(path.rsplit('/').next().unwrap()).filter(|_| !broken) {
+        Some(body) => Reply::Body("200 OK", body.clone()),
+        None => Reply::Body("503 Unavailable", Vec::new()),
+    })
+}
+
+/// A server answering each request path with `reply`.
+fn serve_with(reply: impl Fn(&str) -> Reply + Send + Sync + 'static) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let (responses, log) = (Arc::new(responses.clone()), requests.clone());
+    let (reply, log) = (Arc::new(reply), requests.clone());
     thread::spawn(move || {
         for stream in listener.incoming() {
-            let (mut stream, responses, log) = (stream.unwrap(), responses.clone(), log.clone());
+            let (mut stream, reply, log) = (stream.unwrap(), reply.clone(), log.clone());
             thread::spawn(move || {
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut request = String::new();
@@ -158,12 +175,14 @@ fn serve(responses: &HashMap<String, Vec<u8>>, broken: bool) -> Server {
                     header.clear();
                 }
                 let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
-                let body = responses.get(path.rsplit('/').next().unwrap()).filter(|_| !broken);
-                let status = if body.is_some() { "200 OK" } else { "503 Unavailable" };
-                let body = body.map_or(&[][..], Vec::as_slice);
+                let (status, location, body) = match reply(&path) {
+                    Reply::Body(status, body) => (status, String::new(), body),
+                    Reply::Redirect(to) => ("302 Found", format!("Location: {to}\r\n"), Vec::new()),
+                };
                 log.lock().unwrap().push(path);
-                write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-                stream.write_all(body).unwrap();
+                write!(stream, "HTTP/1.1 {status}\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                       body.len()).unwrap();
+                stream.write_all(&body).unwrap();
             });
         }
     });
@@ -532,4 +551,210 @@ fn checks_what_is_already_downloaded_and_reuses_the_result() {
     assert_eq!((summary.fetched, summary.reused), (2, 1));
     assert_eq!(fs::read(&target).unwrap(), fixture.data);
     assert_eq!(check(summary.on_disk.as_ref()).1, fixture.data.len() as u64);
+}
+
+/// A throwaway key pair made for these tests with `minisign -G -W`; its secret
+/// half is gone. The signatures were made with minisign 0.12, for example
+/// `minisign -S -m new -t "trashpanda 0.3.0 linux-x86_64"`, as `release.sh` does.
+const TEST_KEY: &str = "untrusted comment: minisign public key DF451113307EDA6E
+RWRu2n4wExFF30L2IgjCZhJtN6HAAyXjwQ2C6sp//k5sagAycmQAOVzz
+";
+const NEW_BUILD: &[u8] = b"new build\n";
+/// `NEW_BUILD`, signed as trashpanda 0.3.0 for linux-x86_64.
+const NEW_SIGNATURE: &str = "untrusted comment: signature from minisign secret key
+RURu2n4wExFF3581XhIiZtnSuYZ6DVM8tfXptNWvgEy7VOYBCHGCJvu7fbvtKeCo74Q3iS6x8OWOvC4l61Ajh1+BMIaFBAUuVQA=
+trusted comment: trashpanda 0.3.0 linux-x86_64
+8LFnWuWr+TciEqxVU4rb2++mEBCsEvQt9iFHLVLX7XaWYbB50mtzMjzGaj25L9+eZn/q0a4bA5LQu6DGtf+nDw==
+";
+const OLD_BUILD: &[u8] = b"old build\n";
+/// `OLD_BUILD`, signed as trashpanda 0.1.0 for linux-x86_64.
+const OLD_SIGNATURE: &str = "untrusted comment: signature from minisign secret key
+RURu2n4wExFF3x3UBWBAfA2sNZ2VJ1O09ruVwcE2MrM4OyepbxJeYMud2Ki/HWz4wdBEzBzQT9IlShaRjg7y5MUBqVsyjMSZzQA=
+trusted comment: trashpanda 0.1.0 linux-x86_64
+Azo82RRrRwWSJTLG94b/WDqMM4jZefMr3zED3JufSvwCPY1KsllRPWT+zINgJm1nI+lhXsxTtZYJEE+yVz7pCQ==
+";
+/// `NEW_BUILD`, signed as trashpanda 0.3.0 for linux-x86_64 with another key.
+const FOREIGN_SIGNATURE: &str = "untrusted comment: signature from minisign secret key
+RURc1oXKTT6tUZMiWTKWH3KK3KGrSN851gVeGfVTqTIwWgzTM2RoOmW0bNpeZ8N9ChvGI1H2p5Io8u8c1j6VlH5xtOM5EEXukgc=
+trusted comment: trashpanda 0.3.0 linux-x86_64
+N5esGj9W7dtNHLB7Y4i/JRlOozDAKKgfJSPqiq3CUYh5bo4o4mW6DIBt4xdxyNHKuhCmyUxg8J2mote8W4xBCg==
+";
+const LINUX: &str = "trashpanda-linux-x86_64";
+const WINDOWS: &str = "trashpanda-windows-x86_64.exe";
+
+fn latest(version: &str) -> String {
+    format!(r#"{{"version": "{version}", "assets": {{"linux-x86_64": "{LINUX}", "windows-x86_64": "{WINDOWS}"}}}}"#)
+}
+
+/// A stand-in for GitHub Releases: `latest/download/` redirects to the
+/// release `tag`, which holds `files`.
+fn releases(tag: &str, files: &[(&str, &[u8])]) -> Server {
+    let prefix = format!("/releases/download/{tag}/");
+    let files: HashMap<String, Vec<u8>> =
+        files.iter().map(|(name, data)| (format!("{prefix}{name}"), data.to_vec())).collect();
+    serve_with(move |path| match path.strip_prefix("/releases/latest/download/") {
+        Some(name) => Reply::Redirect(format!("{prefix}{name}")),
+        None => files.get(path).map_or(Reply::Body("404 Not Found", Vec::new()), |data| Reply::Body("200 OK", data.clone())),
+    })
+}
+
+/// Release 0.3.0 with `build` and `signature` as the build for `asset`.
+fn release_with(asset: &str, build: &[u8], signature: &str) -> Server {
+    releases("v0.3.0", &[("latest.json", latest("0.3.0").as_bytes()), (asset, build),
+                         (&format!("{asset}.minisig"), signature.as_bytes())])
+}
+
+fn updater(server: &Server, platform: &str, current: &str) -> update::Updater {
+    let url = format!("{}/releases", server.url);
+    update::Updater::with(&url, platform, current.parse().unwrap(), TEST_KEY).unwrap()
+}
+
+/// Install `release` over a stand-in for the program at `exe`, copying it into
+/// place as `self_replace` does.
+fn install(updater: &update::Updater, release: &update::Release, exe: &Path) -> anyhow::Result<()> {
+    updater.install_at(release, exe, |staged| {
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&fs::metadata(staged)?.permissions()) & 0o777, 0o755);
+        fs::copy(staged, exe).map(drop)
+    })
+}
+
+/// Offer release 0.3.0 to a 0.2.0 build for `platform`, serving `build` and
+/// `signature` for it, and return why installing it failed. The program
+/// must be left as it was. `name` names the scratch directory.
+fn refusal(name: &str, platform: &str, build: &[u8], signature: &str) -> String {
+    let asset = if platform.starts_with("windows") { WINDOWS } else { LINUX };
+    let server = release_with(asset, build, signature);
+    let updater = updater(&server, platform, "0.2.0");
+    let release = updater.check().unwrap().expect("0.3.0 is offered");
+    let temp = TempDir::new(name);
+    let exe = temp.0.join("trashpanda");
+    fs::write(&exe, OLD_BUILD).unwrap();
+    let error = install(&updater, &release, &exe).unwrap_err();
+    assert_eq!(fs::read(&exe).unwrap(), OLD_BUILD);
+    assert!(!temp.0.join(update::STAGED).exists());
+    format!("{error:#}")
+}
+
+#[test]
+fn compares_versions_by_number() {
+    let version = |text: &str| text.parse::<update::Version>().unwrap();
+    assert!(version("0.10.0") > version("0.9.9"));
+    assert!(version("1.0.0") > version("0.99.99"));
+    assert!(version("0.2.1") > version("0.2.0"));
+    assert_eq!(version("1.20.3").to_string(), "1.20.3");
+    for bad in ["", "1.2", "1.2.3.4", "v1.2.3", "1.2.x", "1..2", "1.2.+3", "1.2.3-beta"] {
+        assert!(bad.parse::<update::Version>().is_err(), "{bad:?}");
+    }
+    // The key in minisign.pub and this build's version are usable.
+    update::Updater::new();
+    update::current();
+}
+
+#[test]
+fn reads_latest_json() {
+    let server = releases("v0.3.0", &[]);
+    let linux = updater(&server, "linux-x86_64", "0.2.0");
+    let release = linux.parse_latest(&latest("0.3.0")).unwrap().unwrap();
+    assert_eq!(release.version.to_string(), "0.3.0");
+    assert_eq!(release.page, format!("{}/releases/tag/v0.3.0", server.url));
+    // A release that is not newer is not offered, whatever else it holds.
+    assert!(linux.parse_latest(&latest("0.2.0")).unwrap().is_none());
+    assert!(linux.parse_latest(r#"{"version": "0.1.0"}"#).unwrap().is_none());
+    let error = updater(&server, "macos-aarch64", "0.2.0").parse_latest(&latest("0.3.0")).unwrap_err();
+    assert!(error.to_string().contains("no build for macos-aarch64"), "{error}");
+    for bad in ["", "{}", r#"{"version": "0.3"}"#, r#"{"version": 3}"#,
+                r#"{"version": "0.3.0", "assets": {"linux-x86_64": "../trashpanda"}}"#,
+                r#"{"version": "0.3.0", "assets": {"linux-x86_64": ".hidden"}}"#,
+                r#"{"version": "0.3.0", "assets": {"linux-x86_64": "a?b"}}"#] {
+        assert!(linux.parse_latest(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn installs_a_signed_newer_build() {
+    let server = release_with(LINUX, NEW_BUILD, NEW_SIGNATURE);
+    let updater = updater(&server, "linux-x86_64", "0.2.0");
+    let release = updater.check().unwrap().expect("0.3.0 is newer");
+    assert_eq!(release.version.to_string(), "0.3.0");
+    let temp = TempDir::new("update");
+    let exe = temp.0.join("trashpanda");
+    fs::write(&exe, OLD_BUILD).unwrap();
+    install(&updater, &release, &exe).unwrap();
+    assert_eq!(fs::read(&exe).unwrap(), NEW_BUILD);
+    assert!(!temp.0.join(update::STAGED).exists());
+    // latest.json is found through the redirect, the build in the release it names.
+    assert_eq!(*server.requests.lock().unwrap(), [
+        "/releases/latest/download/latest.json",
+        "/releases/download/v0.3.0/latest.json",
+        "/releases/download/v0.3.0/trashpanda-linux-x86_64",
+        "/releases/download/v0.3.0/trashpanda-linux-x86_64.minisig",
+    ]);
+    // Once on 0.3.0, there is nothing to offer.
+    assert!(self::updater(&server, "linux-x86_64", "0.3.0").check().unwrap().is_none());
+    // An unreachable server is an error, not "up to date".
+    let gone = update::Updater::with("http://127.0.0.1:9/releases", "linux-x86_64", update::current(), TEST_KEY);
+    assert!(gone.unwrap().check().is_err());
+}
+
+#[test]
+fn refuses_builds_without_a_good_signature() {
+    let mut tampered = NEW_BUILD.to_vec();
+    tampered[0] ^= 1;
+    for (name, build, signature, reason) in [
+        ("tampered", &tampered[..], NEW_SIGNATURE, "not signed with the trashpanda release key"),
+        ("foreign", NEW_BUILD, FOREIGN_SIGNATURE, "not signed with the trashpanda release key"),
+        ("garbled", NEW_BUILD, "not a signature", "unreadable signature"),
+        ("unsigned", NEW_BUILD, "", "unreadable signature"),
+    ] {
+        let error = refusal(name, "linux-x86_64", build, signature);
+        assert!(error.contains(reason) && error.contains("refusing the download of version 0.3.0"), "{error}");
+    }
+}
+
+#[test]
+fn refuses_downgrades() {
+    // An older release is not offered.
+    let server = releases("v0.1.0", &[("latest.json", latest("0.1.0").as_bytes()), (LINUX, OLD_BUILD),
+                                      (&format!("{LINUX}.minisig"), OLD_SIGNATURE.as_bytes())]);
+    assert!(updater(&server, "linux-x86_64", "0.2.0").check().unwrap().is_none());
+    // An old build, properly signed, served as the new version.
+    let error = refusal("downgrade", "linux-x86_64", OLD_BUILD, OLD_SIGNATURE);
+    assert!(error.contains("it is signed as version 0.1.0"), "{error}");
+    // A signed build that is not newer than the running one.
+    let server = release_with(LINUX, NEW_BUILD, NEW_SIGNATURE);
+    let release = updater(&server, "linux-x86_64", "0.2.0").check().unwrap().unwrap();
+    let error = updater(&server, "linux-x86_64", "0.3.0").download(&release).unwrap_err();
+    assert!(error.to_string().contains("it is not newer than this version, 0.3.0"), "{error}");
+}
+
+#[test]
+fn refuses_builds_for_another_platform() {
+    // The Linux build, uploaded as the Windows one.
+    let error = refusal("platform", "windows-x86_64", NEW_BUILD, NEW_SIGNATURE);
+    assert!(error.contains("it is signed as a build for linux-x86_64, not windows-x86_64"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn sends_users_to_the_release_page_when_the_folder_is_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = release_with(LINUX, NEW_BUILD, NEW_SIGNATURE);
+    let updater = updater(&server, "linux-x86_64", "0.2.0");
+    let release = updater.check().unwrap().unwrap();
+    let temp = TempDir::new("read-only");
+    let exe = temp.0.join("trashpanda");
+    fs::write(&exe, OLD_BUILD).unwrap();
+    fs::set_permissions(&temp.0, fs::Permissions::from_mode(0o555)).unwrap();
+    let ignored = fs::File::create(temp.0.join("probe")).is_ok(); // Root ignores permissions.
+    let result = (!ignored).then(|| install(&updater, &release, &exe));
+    fs::set_permissions(&temp.0, fs::Permissions::from_mode(0o755)).unwrap();
+    let Some(result) = result else { return };
+    let error = result.unwrap_err();
+    let unwritable = error.downcast_ref::<update::Unwritable>().expect("the folder is reported as read-only");
+    assert_eq!(unwritable.page, format!("{}/releases/tag/v0.3.0", server.url));
+    assert!(error.to_string().contains("download the new version by hand from http://"), "{error}");
+    assert_eq!(fs::read(&exe).unwrap(), OLD_BUILD);
+    // It gives up before downloading the build.
+    assert!(!server.requests.lock().unwrap().iter().any(|path| path.contains(LINUX)));
 }
