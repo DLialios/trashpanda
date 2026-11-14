@@ -52,6 +52,9 @@ pub struct Progress {
     /// Set while a download looks for such content and copies it into place,
     /// which uses the disk and not the network.
     pub local: AtomicBool,
+    /// Set when the folder holds another version of a depot in the package,
+    /// so that the download is an update of what is there.
+    pub update: AtomicBool,
     /// Set to ask the download to stop after the chunks in flight.
     pub stop: AtomicBool,
     log: Mutex<Vec<String>>,
@@ -261,8 +264,10 @@ pub fn check(package: &Package, output: &Path, previous: Option<&OnDisk>, progre
              -> Result<Option<OnDisk>> {
     let (_, targets) = plan(package, output)?;
     progress.total.store(targets.iter().map(|target| target.entry.size).sum(), Relaxed);
-    log::write(format!("check: {output:?}, depots {:?}, {} bytes",
-                       package.depots.iter().map(|depot| depot.id).collect::<Vec<_>>(), progress.total.load(Relaxed)));
+    progress.update.store(installed::updating(output, package), Relaxed);
+    log::write(format!("check: {output:?}, depots {:?}, {} bytes, update {}",
+                       package.depots.iter().map(|depot| depot.id).collect::<Vec<_>>(), progress.total.load(Relaxed),
+                       progress.update.load(Relaxed)));
     let Some(mut on_disk) = check_files(&targets, previous, progress)? else { return Ok(None) };
     let complete = find_elsewhere(&targets, &installed::leftovers(output, package), &mut on_disk, progress);
     Ok(complete.then_some(on_disk))
@@ -565,6 +570,8 @@ pub fn download(package: &Package, output: &Path, jobs: usize, agent: &ureq::Age
         let parents = targets.iter().filter_map(|target| target.path.parent());
         folders.iter().map(PathBuf::as_path).chain(parents).try_for_each(create)
     };
+    // Before the list of installed files is brought up to this version.
+    progress.update.store(installed::updating(output, package), Relaxed);
     // Before the new folders are made: one may be where an old file is.
     let (stale, removed) = installed::begin(output, package, progress)?;
     make_folders()?;
@@ -674,6 +681,7 @@ pub fn download(package: &Package, output: &Path, jobs: usize, agent: &ureq::Age
         summary.paused = true;
         return Ok(summary);
     }
+    installed::complete(output, package)?;
 
     let complete = format!("Complete: {} files, {} in {}.", summary.files, human(summary.bytes),
                            duration(started.elapsed().as_secs()));

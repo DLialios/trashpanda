@@ -804,7 +804,7 @@ fn an_update_copies_what_only_moved_instead_of_downloading_it() {
             fs::write(out.join(name), parts.concat()).unwrap();
         }
         let names = old.iter().map(|(name, _)| name.to_string()).collect();
-        installed::Installed { depots: [(123, names)].into() }.save(out).unwrap();
+        installed::Installed { depots: [(123, names)].into(), ..Default::default() }.save(out).unwrap();
         fs::write(out.join("save.dat"), "mine").unwrap();
 
         // A check finds what is in place and what is elsewhere, and changes nothing.
@@ -1305,4 +1305,54 @@ fn window_icon_is_a_square_png() {
     let icon = crate::gui::icon();
     assert_eq!((icon.width, icon.height), (256, 256));
     assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+}
+
+#[test]
+fn tells_an_update_from_a_first_download() {
+    let temp = TempDir::new("patch");
+    let out = &temp.0;
+    let part = |text: &str, count: usize| text.repeat(count).into_bytes();
+    let (a, b, b2) = (part("aaaa\n", 900), part("bbbb\n", 700), part("BBBB\n", 700));
+    let mut responses = HashMap::new();
+    let v1 = depot_of(123, &[("game.bin", &[&a, &b])], &mut responses);
+    let mut v2 = depot_of(123, &[("game.bin", &[&a, &b2])], &mut responses);
+    v2.manifest = v1.manifest + 1;
+    let server = serve(&responses, false);
+    let (agent, servers) = (download::agent(2), [server.url.clone()]);
+    let package = |depot: &depot::Depot| depot::Package { depots: vec![depot.clone()], ..Default::default() };
+    let download = |depot: &depot::Depot, progress: &Progress| {
+        download::download(&package(depot), out, 2, &agent, &servers, None, progress).unwrap().paused
+    };
+    let updating = |depot: &depot::Depot| {
+        let progress = Progress::default();
+        download::check(&package(depot), out, None, &progress).unwrap();
+        progress.update.load(Relaxed)
+    };
+    let stopped = || {
+        let progress = Progress::default();
+        progress.stop.store(true, Relaxed);
+        progress
+    };
+    fs::create_dir_all(out).unwrap();
+    assert!(!updating(&v1), "nothing is there yet");
+    // A first download that stops early is resumed, not patched.
+    assert!(download(&v1, &stopped()) && !updating(&v1));
+    assert!(!download(&v1, &Progress::default()));
+    assert!(!updating(&v1), "the same version, in full");
+    assert!(updating(&v2), "another version of the depot is there");
+
+    // It is still an update after a pause, and no longer one once it is done.
+    let (paused, done) = (stopped(), Progress::default());
+    assert!(download(&v2, &paused) && paused.update.load(Relaxed) && updating(&v2));
+    assert!(!download(&v2, &done) && done.update.load(Relaxed) && !updating(&v2));
+    assert_eq!(fs::read(out.join("game.bin")).unwrap(), [&a[..], &b2].concat());
+    assert_eq!(installed::Installed::load(out).unwrap().manifests, [(123, v2.manifest)].into());
+
+    // A list from before manifests were recorded shows another version only by its files.
+    let old = |names: &[&str]| {
+        let names = names.iter().map(|name| name.to_string()).collect();
+        installed::Installed { depots: [(123, names)].into(), ..Default::default() }.save(out).unwrap();
+        updating(&v2)
+    };
+    assert!(old(&["game.bin", "gone.bin"]) && !old(&["game.bin"]));
 }

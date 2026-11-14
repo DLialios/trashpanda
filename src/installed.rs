@@ -26,6 +26,10 @@ const ABOUT: &str = "The files Trash Panda put in this folder, by depot. When a 
 #[derive(Debug, Default, PartialEq)]
 pub struct Installed {
     pub depots: BTreeMap<u32, BTreeSet<String>>,
+    /// For each depot, the manifest last downloaded in full. A depot has none
+    /// while its first download is unfinished, or if the list was made before
+    /// manifests were recorded.
+    pub manifests: BTreeMap<u32, u64>,
 }
 
 impl Installed {
@@ -49,6 +53,12 @@ impl Installed {
             let files = files.iter().map(|file| file.as_str().map(String::from).context("a file name is not text"));
             installed.depots.insert(id, files.collect::<Result<_>>()?);
         }
+        // Text, as JSON numbers cannot hold every manifest ID. Older lists have none.
+        for (id, manifest) in value["manifests"].as_object().into_iter().flatten() {
+            let manifest = manifest.as_str().and_then(|manifest| manifest.parse().ok());
+            let id = id.parse().with_context(|| format!("{id:?} is not a depot ID"))?;
+            installed.manifests.insert(id, manifest.with_context(|| format!("depot {id} has no valid manifest ID"))?);
+        }
         Ok(installed)
     }
 
@@ -59,7 +69,11 @@ impl Installed {
         let depots: serde_json::Map<String, serde_json::Value> = self.depots.iter()
             .map(|(id, files)| (id.to_string(), files.iter().cloned().collect()))
             .collect();
-        let text = serde_json::to_string_pretty(&serde_json::json!({ "about": ABOUT, "depots": depots }))? + "\n";
+        let manifests: serde_json::Map<String, serde_json::Value> = self.manifests.iter()
+            .map(|(id, manifest)| (id.to_string(), manifest.to_string().into()))
+            .collect();
+        let list = serde_json::json!({ "about": ABOUT, "depots": depots, "manifests": manifests });
+        let text = serde_json::to_string_pretty(&list)? + "\n";
         let temp = output.join(format!("{FILE}.new"));
         _ = fs::remove_file(&temp); // Left by a crash; also never write through a link put there.
         let mut file = OpenOptions::new().write(true).create_new(true).open(&temp).with_context(failed)?;
@@ -118,6 +132,25 @@ pub fn leftovers(output: &Path, package: &Package) -> Vec<PathBuf> {
     let installed = Installed::load(output).unwrap_or_default();
     let late = dropped(&installed, package).into_iter().filter(|(_, _, in_the_way)| !in_the_way);
     late.filter_map(|(_, name, _)| existing(output, &name)).collect()
+}
+
+/// Whether `output` holds another version of a depot in `package`, so that
+/// downloading the package there updates it. Changes nothing.
+pub fn updating(output: &Path, package: &Package) -> bool {
+    let installed = Installed::load(output).unwrap_or_default();
+    package.depots.iter().any(|depot| match installed.manifests.get(&depot.id) {
+        Some(manifest) => *manifest != depot.manifest,
+        // A list from before manifests were recorded, or of a first download
+        // not yet finished: another version shows only in the files it lists.
+        None => installed.depots.get(&depot.id).is_some_and(|listed| !listed.iter().cloned().eq(files(depot).collect::<BTreeSet<_>>())),
+    })
+}
+
+/// Record that the depots of `package` are now in `output` in full.
+pub fn complete(output: &Path, package: &Package) -> Result<()> {
+    let mut installed = Installed::load(output)?;
+    installed.manifests.extend(package.depots.iter().map(|depot| (depot.id, depot.manifest)));
+    installed.save(output)
 }
 
 /// The path of the file `name` in `output`, if it is safe and there is one.
