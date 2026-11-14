@@ -1,12 +1,15 @@
 //! trashpanda: download Steam depots from a manifest package. Given a
 //! package it runs in the terminal; without arguments it opens a window.
 
+mod appinfo;
 mod depot;
 mod download;
+mod glimpse;
 mod gui;
 mod installed;
 mod log;
 mod moved;
+mod select;
 #[cfg(test)]
 mod tests;
 mod update;

@@ -1,7 +1,6 @@
 //! The window: choose a package and an output folder, then press Download.
 
-use std::collections::BTreeSet;
-use std::fmt::Write;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -10,30 +9,69 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use eframe::egui;
-use egui_extras::{Column, TableBuilder};
 
-use crate::depot::{self, Package};
+use crate::appinfo::{self, Found, Lookup, Record};
+use crate::depot::{self, Depot, Package};
 use crate::download::{self, Meter, OnDisk, Progress};
+use crate::glimpse::Platform;
 use crate::log;
+use crate::select::{self, Choices, Offer, Selector, Tags};
 use crate::update::{self, Release, Unwritable, Updater, Version};
 
 const TITLE: &str = "Trash Panda";
+/// How far inside the main window's edges the log and the depots open.
+const MODAL_MARGIN: f32 = 48.0;
+/// The width of the path fields' labels.
+const LABEL: f32 = 96.0;
+/// A kind of tag with this many values or more is a list rather than tiles.
+const LIST_FROM: usize = 12;
+const TILE_HEIGHT: f32 = 52.0;
+/// The space between tiles, across and down.
+const TILE_GAP: f32 = 8.0;
+const ROW_HEIGHT: f32 = 36.0;
+/// How many rows a list shows before it scrolls, unless it is the last and
+/// there is room for more.
+const LIST_ROWS: f32 = 10.0;
 
 pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(TITLE)
             .with_icon(icon())
-            .with_inner_size([800.0, 640.0])
+            .with_inner_size([1000.0, 700.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native(TITLE, options, Box::new(|creation| {
         creation.egui_ctx.set_theme(egui::Theme::Dark);
+        set_fonts(&creation.egui_ctx);
         let mut app = App::default();
         app.check_for_update(true);
         Ok(Box::new(app))
     }))
+}
+
+/// The name of the font family for headings and big numbers.
+const BOLD: &str = "bold";
+
+/// Use Noto Sans for text, and its semibold as the `BOLD` family. egui's own
+/// fonts stay behind both, for the symbols Noto Sans lacks.
+fn set_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut add = |name: &str, font: &'static [u8], family: egui::FontFamily| {
+        fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_static(font)));
+        let mut names = vec![name.to_string()];
+        names.extend(fonts.families.get(&egui::FontFamily::Proportional).into_iter().flatten().cloned());
+        fonts.families.insert(family, names);
+    };
+    add("semibold", include_bytes!("../assets/fonts/NotoSans-SemiBold.ttf"), egui::FontFamily::Name(BOLD.into()));
+    add("regular", include_bytes!("../assets/fonts/NotoSans-Regular.ttf"), egui::FontFamily::Proportional);
+    ctx.set_fonts(fonts);
+}
+
+/// Text in the semibold font and the brightest colour.
+fn bold(text: impl Into<String>, size: f32) -> egui::RichText {
+    egui::RichText::new(text).size(size).family(egui::FontFamily::Name(BOLD.into())).strong()
 }
 
 /// The icon of the window, which the title bar and taskbar show. eframe
@@ -53,14 +91,16 @@ struct Choice {
     skip: BTreeSet<u32>,
 }
 
-struct App {
+pub struct App {
     package: String,
     output: String,
-    jobs: usize,
     /// Depots not to download.
     skip: BTreeSet<u32>,
     /// The package path last read for display, and what reading it gave.
     info: Option<(String, Result<Arc<Package>, String>)>,
+    picker: Picker,
+    /// Where Steam's records of apps come from.
+    mirror: String,
     /// The choice whose state the progress bar shows.
     shown: Choice,
     /// What is on disk for a choice, from the last check or download of it.
@@ -69,6 +109,10 @@ struct App {
     meter: Meter,
     task: Option<Task>,
     update: Update,
+    /// A file dialog that is open, and what it is for. It runs on a thread
+    /// of its own: while the window's thread waited for it, the window
+    /// answered nothing, and the system took it for frozen.
+    picking: Option<(Pick, JoinHandle<Option<PathBuf>>)>,
     /// Whether the log window is open.
     log_open: bool,
     /// What last went wrong with a check, a download or saving the log, in
@@ -92,6 +136,14 @@ enum Update {
     Failed { message: String, page: Option<String> },
 }
 
+/// What a file dialog is open for.
+enum Pick {
+    Package,
+    Output,
+    /// Where to save the log.
+    Log,
+}
+
 /// A check or a download running on its own thread.
 struct Task {
     download: bool,
@@ -104,15 +156,17 @@ impl Default for App {
         Self {
             package: String::new(),
             output: String::new(),
-            jobs: crate::DEFAULT_JOBS,
             skip: BTreeSet::new(),
             info: None,
+            picker: Picker::default(),
+            mirror: appinfo::MIRROR.into(),
             shown: Choice::default(),
             on_disk: None,
             progress: Arc::default(),
             meter: Meter::default(),
             task: None,
             update: Update::Idle,
+            picking: None,
             log_open: false,
             error: None,
         }
@@ -143,14 +197,31 @@ impl App {
         let path = self.package.trim();
         if path.is_empty() {
             self.info = None;
+            self.picker = Picker::default();
         } else if self.info.as_ref().is_none_or(|(read, _)| read != path) {
             log::write(format!("gui: package {path:?}"));
             let package = depot::read_package(Path::new(path)).map(Arc::new).map_err(|error| {
                 log::write(format!("gui: cannot use the package: {error:#}"));
                 log::brief(&error)
             });
+            // A new picker drops the lookup for the package before, which
+            // then can no longer change anything.
+            self.picker = match &package {
+                Ok(package) => Picker::new(package, Some(&self.mirror)),
+                Err(_) => Picker::default(),
+            };
+            self.skip = self.picker.skip();
             self.info = Some((path.to_string(), package));
-            self.skip.clear();
+        }
+    }
+
+    /// Take what the lookup of the app's record has found. The record
+    /// changes what is chosen, so it waits while a download runs.
+    fn collect_lookup(&mut self, downloading: bool) {
+        if let (false, Some(package)) = (downloading, self.parsed())
+            && self.picker.collect(&package)
+        {
+            self.skip = self.picker.skip();
         }
     }
 
@@ -174,7 +245,7 @@ impl App {
 
     fn start(&mut self) {
         let Some(package) = self.selected() else { return };
-        let (output, jobs, previous) = (PathBuf::from(self.output.trim()), self.jobs, self.previous());
+        let (output, jobs, previous) = (PathBuf::from(self.output.trim()), crate::DEFAULT_JOBS, self.previous());
         log::write(format!("gui: download {:?} into {output:?}, skipping depots {:?}, {jobs} jobs, previous check {}",
                            self.package.trim(), self.skip, previous.is_some()));
         self.spawn(true, move |progress| {
@@ -225,7 +296,49 @@ impl App {
                 Err(_) => {
                     log::write(format!("gui: {kind} crashed"));
                     self.error = Some(format!("The {kind} crashed. This is a bug: please send the log \
-                                               (Show log, then Export log…)."));
+                                               (the log button at the top right, then Export log…)."));
+                }
+            }
+        }
+    }
+
+    /// Open a file dialog for `pick`, unless one is open.
+    fn pick(&mut self, ctx: &egui::Context, pick: Pick) {
+        if self.picking.is_some() {
+            return;
+        }
+        let dialog = rfd::FileDialog::new();
+        let start = self.output.trim().to_string();
+        let ctx = ctx.clone();
+        let run = move |dialog: Box<dyn FnOnce() -> Option<PathBuf> + Send>| thread::spawn(move || {
+            let path = dialog();
+            ctx.request_repaint(); // Wake the window to take the answer.
+            path
+        });
+        let job = match pick {
+            Pick::Package => run(Box::new(move || dialog.add_filter("Package", &["zip"]).pick_file())),
+            Pick::Output if start.is_empty() => run(Box::new(move || dialog.pick_folder())),
+            Pick::Output => run(Box::new(move || dialog.set_directory(start).pick_folder())),
+            Pick::Log => run(Box::new(move || dialog.set_file_name("trashpanda-log.txt").save_file())),
+        };
+        self.picking = Some((pick, job));
+    }
+
+    /// Take the answer of a file dialog that has closed.
+    fn collect_pick(&mut self) {
+        if self.picking.as_ref().is_none_or(|(_, job)| !job.is_finished()) {
+            return;
+        }
+        let (pick, job) = self.picking.take().unwrap();
+        let Ok(Some(path)) = job.join() else { return }; // Cancelled.
+        match pick {
+            Pick::Package => self.package = path.display().to_string(),
+            Pick::Output => self.output = path.display().to_string(),
+            Pick::Log => {
+                log::write(format!("gui: saving the log to {path:?}"));
+                if let Err(error) = log::save(&path).context("could not save the log") {
+                    log::write(format!("gui: {error:#}"));
+                    self.error = Some(log::brief(&error));
                 }
             }
         }
@@ -292,15 +405,11 @@ impl App {
         };
     }
 
-    /// The update button and what it found, laid out right to left.
+    /// The update button and, to its left, what it found, laid out right to
+    /// left. Pressing it checks for a newer version, or installs one found.
     fn update_controls(&mut self, ui: &mut egui::Ui, downloading: bool) {
-        match &mut self.update {
-            Update::Checking { quiet: false, .. } => {
-                ui.label("Checking for updates…");
-                ui.spinner();
-            }
+        let pressed = match &self.update {
             Update::Available(release) => {
-                let release = release.clone();
                 // Why it cannot be installed now: in a few words, and in full.
                 let blocked = if !update::REPLACES_ITSELF {
                     Some(("Debug build", "A debug build is never replaced by an update"))
@@ -309,44 +418,52 @@ impl App {
                 } else {
                     None
                 };
-                let button = ui.add_enabled(blocked.is_none(), egui::Button::new("Update"));
-                if button.on_disabled_hover_text(blocked.map_or("", |(_, why)| why)).clicked() {
-                    self.install_update(release.clone());
-                }
+                let button = ui.add_enabled(blocked.is_none(), icon_button(Icon::Update, true));
+                let pressed = button.on_hover_text(format!("Install version {}", release.version))
+                    .on_disabled_hover_text(blocked.map_or("", |(_, why)| why)).clicked();
                 if let Some((label, _)) = blocked {
                     ui.weak(label);
                 }
-                ui.hyperlink_to(format!("Version {} is available", release.version), &release.page)
+                ui.hyperlink_to(format!("Version {} is out", release.version), &release.page)
                     .on_hover_text("What is new in it");
+                pressed
             }
-            Update::Installing { version, .. } => {
-                ui.label(format!("Updating to {version}…"));
-                ui.spinner();
-            }
-            Update::Restarting => {
-                ui.label("Restarting…");
-            }
-            Update::Idle | Update::Current | Update::Failed { .. } | Update::Checking { quiet: true, .. } => {
-                if ui.button("Check for updates").clicked() {
-                    match &mut self.update {
-                        Update::Checking { quiet, .. } => *quiet = false, // Show the quiet check instead.
-                        _ => self.check_for_update(false),
-                    }
+            state => {
+                let words = match state {
+                    Update::Checking { quiet: false, .. } => Some("Checking for updates…".to_string()),
+                    Update::Current => Some("Up to date".into()),
+                    Update::Installing { version, .. } => Some(format!("Updating to {version}…")),
+                    Update::Restarting => Some("Restarting…".into()),
+                    _ => None,
+                };
+                // Words mean it is busy, or has said what it found.
+                let busy = words.is_some() && !matches!(state, Update::Current);
+                let pressed = ui.add_enabled(!busy, icon_button(Icon::Update, false)).on_hover_text("Check for updates").clicked();
+                if let Some(words) = words {
+                    ui.label(words);
                 }
-                if matches!(self.update, Update::Current) {
-                    ui.weak("Up to date");
+                pressed
+            }
+        };
+        if pressed {
+            match &mut self.update {
+                Update::Available(release) => {
+                    let release = release.clone();
+                    self.install_update(release);
                 }
+                Update::Checking { quiet, .. } => *quiet = false, // Show the quiet check instead.
+                _ => self.check_for_update(false),
             }
         }
     }
 
     /// The progress in big type with the Pause button, or before a download,
-    /// how much there is to download with the Download or Resume button.
+    /// how much there is to download with the Download, Resume or Patch button.
     fn readout(&mut self, ui: &mut egui::Ui, downloading: bool, checking: bool, updating: bool) {
         let (done, total) = (self.progress.done.load(Relaxed), self.progress.total.load(Relaxed));
         let fraction = self.progress.fraction();
         let percent = format!("{:.1}%", fraction * 100.0);
-        let big = |text: String| egui::RichText::new(text).size(64.0).strong();
+        let big = |text: String| bold(text, 64.0);
         let bar = |ui: &mut egui::Ui| ui.add(egui::ProgressBar::new(fraction).desired_height(14.0).corner_radius(7.0));
         if downloading {
             let rates = self.meter.update(&self.progress, Instant::now());
@@ -354,7 +471,7 @@ impl App {
                 ui.label(big(percent));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
                     ui.label(egui::RichText::new("left").size(22.0).weak());
-                    ui.label(egui::RichText::new(rates.left_text()).size(40.0).strong());
+                    ui.label(bold(rates.left_text(), 40.0));
                 });
             });
             ui.add_space(6.0);
@@ -391,15 +508,24 @@ impl App {
             None => (String::new(), String::new()),
         };
         row(ui, egui::Align::Center, |ui| {
-            ui.label(big(amount));
+            let number = ui.label(big(amount)).rect;
             let note = if checking { "checking what is\nalready downloaded…".into() } else { note };
-            ui.label(egui::RichText::new(note).size(16.0).weak());
+            // Beside the foot of the number, from the bottom up: the space is
+            // about what the big digits leave under their baseline.
+            let foot = egui::Layout::bottom_up(egui::Align::Min);
+            ui.allocate_ui_with_layout(egui::vec2(260.0, number.height()), foot, |ui| {
+                ui.add_space(12.0);
+                if let Some(package) = &package {
+                    let chosen = package.depots.iter().filter(|depot| !self.skip.contains(&depot.id)).count();
+                    let link = format!("{chosen} of {} depots", package.depots.len());
+                    if ui.link(egui::RichText::new(link).size(14.0)).on_hover_text("Show the depots").clicked() {
+                        self.picker.list_open = !self.picker.list_open;
+                    }
+                }
+                ui.label(egui::RichText::new(note).size(16.0).weak());
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = match () {
-                    _ if checking => "Checking…",
-                    _ if done > 0 && done < total => "Resume",
-                    _ => "Download",
-                };
+                let label = Next::of(checking, self.progress.update.load(Relaxed), done, total).label();
                 let ready = !checking && !updating && size.is_some() && !no_output;
                 if big_button(ui, label, true, ready).clicked() {
                     self.start();
@@ -419,20 +545,12 @@ impl App {
         }
         let lines = log::lines();
         let rows: Vec<&str> = lines.iter().flat_map(|line| line.lines()).collect();
-        egui::Window::new("Log")
+        let mut export = false;
+        modal(ctx, "Log")
             .open(&mut self.log_open)
-            .collapsible(false)
-            .pivot(egui::Align2::CENTER_BOTTOM)
-            .default_pos(ctx.content_rect().center_bottom() - egui::vec2(0.0, 40.0))
-            .default_size([700.0, 260.0])
             .show(ctx, |ui| {
-                let export = ui.button("Export log…").on_hover_text("Save the log to a text file, for a bug report");
-                if export.clicked()
-                    && let Err(error) = export_log()
-                {
-                    log::write(format!("gui: {error:#}"));
-                    self.error = Some(log::brief(&error));
-                }
+                let button = ui.add_enabled(self.picking.is_none(), egui::Button::new("Export log…"));
+                export = button.on_hover_text("Save the log to a text file, for a bug report").clicked();
                 egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(6.0).inner_margin(8.0).show(ui, |ui| {
                     // Each row on one line, so that only the rows in view need laying out.
                     let height = ui.text_style_height(&egui::TextStyle::Monospace);
@@ -444,6 +562,42 @@ impl App {
                     });
                 });
             });
+        if export {
+            self.pick(ctx, Pick::Log);
+        }
+    }
+
+    /// The depots in a window of its own, in ID order, each with its tags
+    /// and a box to tick it by hand.
+    fn show_depots(&mut self, ctx: &egui::Context, editable: bool) {
+        let Some(package) = self.parsed().filter(|_| self.picker.list_open) else { return };
+        let (picker, skip) = (&mut self.picker, &mut self.skip);
+        let mut open = true;
+        modal(ctx, "Depots")
+            .open(&mut open)
+            .show(ctx, |ui| {
+                row(ui, egui::Align::Center, |ui| {
+                    let chosen = package.depots.iter().filter(|depot| !skip.contains(&depot.id)).count();
+                    ui.weak(format!("{chosen} of {} depots chosen", package.depots.len()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.selectable_value(&mut picker.list_all, true, "All");
+                        ui.selectable_value(&mut picker.list_all, false, "Chosen");
+                    });
+                });
+                let mut depots: Vec<&Depot> =
+                    package.depots.iter().filter(|depot| picker.list_all || !skip.contains(&depot.id)).collect();
+                depots.sort_by_key(|depot| depot.id);
+                egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(6.0).inner_margin(8.0).show(ui, |ui| {
+                    let height = ui.spacing().interact_size.y;
+                    let scroll = egui::ScrollArea::vertical().auto_shrink(false);
+                    scroll.show_rows(ui, height, depots.len(), |ui, range| {
+                        for depot in &depots[range] {
+                            depot_row(ui, depot, picker, skip, editable);
+                        }
+                    });
+                });
+            });
+        self.picker.list_open = open;
     }
 }
 
@@ -451,6 +605,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.collect();
         self.collect_update(ui.ctx());
+        self.collect_pick();
         let downloading = self.task.as_ref().is_some_and(|task| task.download);
         let updating = matches!(self.update, Update::Installing { .. } | Update::Restarting);
         let dropped = ui.input(|input| input.raw.dropped_files.first().map(|file| file.path().to_path_buf()));
@@ -459,23 +614,12 @@ impl eframe::App for App {
             self.package = path.display().to_string();
         }
         self.read_info();
+        self.collect_lookup(downloading);
         self.check();
         let checking = self.task.as_ref().is_some_and(|task| !task.download);
-        egui::Panel::bottom("footer").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let label = if self.log_open { "Hide log" } else { "Show log" };
-                if ui.add(egui::Button::new(label).frame(false)).clicked() {
-                    self.log_open = !self.log_open;
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_enabled_ui(!downloading, |ui| {
-                        let jobs = ui.add(egui::DragValue::new(&mut self.jobs).range(1..=64));
-                        jobs.on_disabled_hover_text("Pause to change");
-                        ui.label("Parallel downloads");
-                    });
-                });
-            });
-        });
+        let (done, total) = (self.progress.done.load(Relaxed), self.progress.total.load(Relaxed));
+        let next = Next::of(checking, self.progress.update.load(Relaxed), done, total);
+        let press = what_to_press(next, !self.output.trim().is_empty(), downloading);
         egui::Panel::bottom("readout").show(ui, |ui| {
             ui.add_space(10.0);
             self.readout(ui, downloading, checking, updating);
@@ -486,9 +630,14 @@ impl eframe::App for App {
         });
         egui::CentralPanel::default().show(ui, |ui| {
             row(ui, egui::Align::Max, |ui| {
-                ui.label(egui::RichText::new(TITLE).size(30.0).italics().strong());
+                ui.label(bold(TITLE, 30.0).italics());
                 ui.label(egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).weak());
+                // From the right: the log, then updates, whose words have the bar to grow into.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let log = if self.log_open { "Hide the log" } else { "Show the log" };
+                    if ui.add(icon_button(Icon::Log, false)).on_hover_text(log).clicked() {
+                        self.log_open = !self.log_open;
+                    }
                     self.update_controls(ui, downloading);
                 });
             });
@@ -501,21 +650,24 @@ impl eframe::App for App {
                 });
             }
             ui.separator();
+            let mut pick = None;
             ui.add_enabled_ui(!downloading, |ui| {
+                let browse = self.picking.is_none();
                 let hint = "Choose a package .zip, or drop one on the window";
-                path_field(ui, "Package", hint, &mut self.package, || {
-                    rfd::FileDialog::new().add_filter("Package", &["zip"]).pick_file()
-                });
-                let start = self.output.trim().to_string();
-                path_field(ui, "Output folder", "Choose a folder for the game's files", &mut self.output, || {
-                    let dialog = rfd::FileDialog::new();
-                    if start.is_empty() { dialog } else { dialog.set_directory(start) }.pick_folder()
-                });
+                if path_field(ui, "Package", hint, &mut self.package, browse) {
+                    pick = Some(Pick::Package);
+                }
+                if path_field(ui, "Download to", "Choose a folder for the game's files", &mut self.output, browse) {
+                    pick = Some(Pick::Output);
+                }
             });
+            if let Some(pick) = pick {
+                self.pick(ui.ctx(), pick);
+            }
             match &self.info {
                 Some((_, Ok(package))) => {
                     ui.add_space(8.0);
-                    show_package(ui, package, &mut self.skip, !downloading);
+                    show_package(ui, package, &mut self.picker, &mut self.skip, !downloading, press);
                 }
                 Some((_, Err(error))) => {
                     ui.colored_label(ui.visuals().error_fg_color, error);
@@ -524,17 +676,28 @@ impl eframe::App for App {
             }
         });
         self.show_log(ui.ctx());
-        if self.task.is_some() || matches!(self.update, Update::Checking { .. } | Update::Installing { .. }) {
+        self.show_depots(ui.ctx(), !downloading);
+        let looking = self.picker.lookup.is_some();
+        if self.task.is_some() || looking || matches!(self.update, Update::Checking { .. } | Update::Installing { .. }) {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
     }
+}
+
+/// A window that opens over the middle of the main one, a margin in from
+/// its edges: the log, and the depots.
+fn modal<'open>(ctx: &egui::Context, title: &str) -> egui::Window<'open> {
+    let room = ctx.content_rect();
+    // The size is of what is inside it, so its own title and frame come off.
+    let inside = (room.size() - egui::vec2(2.0 * MODAL_MARGIN + 16.0, 2.0 * MODAL_MARGIN + 44.0)).max(egui::vec2(200.0, 120.0));
+    egui::Window::new(title).collapsible(false).pivot(egui::Align2::CENTER_CENTER).default_pos(room.center()).default_size(inside)
 }
 
 /// What to do first, in the middle of the space left in `ui`.
 fn welcome(ui: &mut egui::Ui) {
     ui.add_space((ui.available_height() / 2.0 - 50.0).max(0.0));
     ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new("To begin, choose a package and an output folder").size(20.0).strong());
+        ui.label(bold("To begin, choose a package and an output folder", 20.0));
         ui.add_space(8.0);
         let text = "The package is a .zip with a .lua file and .manifest files;\n\
                     you can also drop it onto this window. Then press Download.";
@@ -549,124 +712,711 @@ fn row<R>(ui: &mut egui::Ui, align: egui::Align, add: impl FnOnce(&mut egui::Ui)
 
 /// A large button, filled with the accent colour if it is the `main` one.
 fn big_button(ui: &mut egui::Ui, text: &str, main: bool, enabled: bool) -> egui::Response {
-    let text = egui::RichText::new(text).size(17.0);
     let button = if main {
-        egui::Button::new(text.strong().color(egui::Color32::WHITE)).fill(ui.visuals().selection.bg_fill)
+        egui::Button::new(bold(text, 17.0).color(egui::Color32::WHITE)).fill(ui.visuals().selection.bg_fill)
     } else {
-        egui::Button::new(text)
+        egui::Button::new(egui::RichText::new(text).size(17.0))
     };
     ui.add_enabled(enabled, button.min_size(egui::vec2(140.0, 40.0)).corner_radius(8.0))
 }
 
-/// A labelled text field filling the row, with a Browse button that runs `pick`.
-fn path_field(ui: &mut egui::Ui, label: &str, hint: &str, text: &mut String, pick: impl FnOnce() -> Option<PathBuf>) {
+/// A labelled text field filling the row, with a Browse button, which can be
+/// pressed if `browse`. Returns whether it was.
+fn path_field(ui: &mut egui::Ui, label: &str, hint: &str, text: &mut String, browse: bool) -> bool {
     ui.horizontal(|ui| {
-        let label_width = ui.label(label).rect.width();
-        ui.add_space((96.0 - label_width).max(0.0));
+        row_label(ui, label);
         let button_width = 80.0;
         let field = egui::TextEdit::singleline(text).hint_text(hint);
         ui.add(field.desired_width(ui.available_width() - button_width));
-        if ui.button("Browse…").clicked()
-            && let Some(path) = pick()
-        {
-            *text = path.display().to_string();
+        ui.add_enabled(browse, egui::Button::new("Browse…")).clicked()
+    }).inner
+}
+
+/// What the window offers to choose for the package last read: from Steam's
+/// record of the app once it arrives, and from the depots' files until then
+/// or if it never does.
+#[derive(Default)]
+struct Picker {
+    /// The lookup of the app's record and its DLC's names, while it runs.
+    lookup: Option<Lookup>,
+    record: Option<Record>,
+    /// The names of DLC, as far as they are known.
+    names: HashMap<u32, String>,
+    sizes: BTreeMap<u32, u64>,
+    tags: BTreeMap<u32, Tags>,
+    offer: Offer,
+    choices: Choices,
+    /// What each list is searched for.
+    search: HashMap<Selector, String>,
+    /// Whether the depots window is open, and whether it shows every depot
+    /// rather than only the chosen ones.
+    list_open: bool,
+    list_all: bool,
+}
+
+impl Picker {
+    /// The picker for `package`, looking up its app on `mirror` if one is given.
+    fn new(package: &Package, mirror: Option<&str>) -> Self {
+        let sizes = package.depots.iter().map(|depot| (depot.id, depot.size())).collect();
+        let mut picker = Picker { sizes, ..Picker::default() };
+        // A package that carries the record needs no lookup.
+        if let Some((record, names)) = appinfo::bundled(package) {
+            picker.names = names;
+            picker.use_record(package, Some(record));
+            return picker;
+        }
+        picker.lookup = package.app.zip(mirror).map(|(app, mirror)| {
+            log::write(format!("gui: looking up app {app}"));
+            Lookup::start(mirror, app, package.depots.iter().map(|depot| depot.id).collect())
+        });
+        picker.use_record(package, None);
+        picker
+    }
+
+    /// Go by `record`, or by the depots' files without one, and start over
+    /// from its first choices.
+    fn use_record(&mut self, package: &Package, record: Option<Record>) {
+        self.tags = select::tags(&package.depots, record.as_ref());
+        self.offer = Offer::of(&self.tags);
+        self.choices = self.offer.start(Platform::here());
+        self.record = record;
+        log::write(format!("gui: tags of {} depots from {}: selectors {:?}, {} DLC; choosing {:?} {:?} {:?}",
+                           self.tags.len(), if self.record.is_some() { "the record" } else { "the files" },
+                           self.offer.selectors(), self.offer.dlc.len(),
+                           self.choices.system, self.choices.arch, self.choices.language));
+    }
+
+    /// The depots the choices leave out.
+    fn skip(&self) -> BTreeSet<u32> {
+        select::skip(&self.tags, &self.choices)
+    }
+
+    fn dlc_name(&self, dlc: u32) -> String {
+        self.names.get(&dlc).cloned().unwrap_or_else(|| format!("DLC {dlc}"))
+    }
+
+    /// Take what the lookup has found. Returns whether the record came, which
+    /// changes what is chosen.
+    fn collect(&mut self, package: &Package) -> bool {
+        let Some(lookup) = &mut self.lookup else { return false };
+        let (found, done) = (lookup.found(), lookup.is_done());
+        if done {
+            self.lookup = None;
+        }
+        let mut changed = false;
+        for found in found {
+            match found {
+                Found::Record(Some(record)) => {
+                    self.use_record(package, Some(record));
+                    changed = true;
+                }
+                Found::Record(None) => {}
+                Found::Name(dlc, name) => _ = self.names.insert(dlc, name),
+            }
+        }
+        changed
+    }
+}
+
+/// The app's name and build, and under them each kind of tag the depots
+/// have. Changing one chooses the depots again by Steam's rule. With nothing
+/// to choose, it says so and what to `press`.
+fn show_package(ui: &mut egui::Ui, package: &Package, picker: &mut Picker, skip: &mut BTreeSet<u32>, editable: bool,
+                press: Option<&str>) {
+    let name = picker.record.as_ref().and_then(|record| record.name.clone())
+        .or_else(|| package.app_name.clone())
+        .or_else(|| package.app.map(|app| format!("App {app}")));
+    // Wrapped, as a line too long for the window would push what is lined up
+    // on the right out of it.
+    let line = egui::Layout::left_to_right(egui::Align::Max).with_main_wrap(true);
+    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 0.0), line, |ui| {
+        if let Some(name) = name {
+            ui.label(bold(name, 28.0));
+        }
+        if let Some(build) = package.build_id() {
+            let text = egui::RichText::new(format!("Build {build}")).size(14.0);
+            match package.app {
+                Some(app) => {
+                    let builds = format!("https://steamdb.info/app/{app}/patchnotes/");
+                    ui.hyperlink_to(text, builds).on_hover_text("The app's builds on SteamDB, to see whether there is a newer one");
+                }
+                None => _ = ui.label(text),
+            }
+        }
+        if picker.lookup.is_some() {
+            ui.spinner().on_hover_text("Fetching Steam's record of the app and its DLC");
+        }
+    });
+    ui.add_space(12.0);
+    let kinds = arranged(&picker.offer);
+    if kinds.is_empty() {
+        if let (None, Some(press)) = (&picker.lookup, press) {
+            what_next(ui, press);
+        }
+        return;
+    }
+    ui.add_enabled_ui(editable, |ui| {
+        if selectors(ui, picker, &kinds) {
+            *skip = picker.skip();
         }
     });
 }
 
-/// Save the session log to a file the user picks.
-fn export_log() -> anyhow::Result<()> {
-    let Some(path) = rfd::FileDialog::new().set_file_name("trashpanda-log.txt").save_file() else { return Ok(()) };
-    log::write(format!("gui: saving the log to {path:?}"));
-    log::save(&path).context("could not save the log")
+/// What to `press`, in the middle of the space left: all there is to say
+/// for a package with nothing to choose.
+fn what_next(ui: &mut egui::Ui, press: &str) {
+    ui.add_space(((ui.available_height() - 30.0) / 2.0).max(0.0));
+    ui.vertical_centered(|ui| ui.label(bold(press, 20.0)));
 }
 
-/// The app and the depots in the chosen package, with a box to tick for each
-/// depot to download. The heading row stays put while the depots scroll.
-fn show_package(ui: &mut egui::Ui, package: &Package, skip: &mut BTreeSet<u32>, editable: bool) {
-    let mut app = Vec::new();
-    if let Some(name) = &package.app_name {
-        app.push(egui::RichText::new(name).strong());
+/// What the main button does before a download, which its label says.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Next {
+    Checking,
+    Download,
+    /// The folder holds another version, which this one replaces.
+    Patch,
+    Resume,
+    /// Everything is there already: downloading again only checks it.
+    Done,
+}
+
+impl Next {
+    /// `update` is whether the folder holds another version; `done` and
+    /// `total` are what the last check or download found.
+    pub(crate) fn of(checking: bool, update: bool, done: u64, total: u64) -> Self {
+        match () {
+            _ if checking => Next::Checking,
+            _ if update && done < total => Next::Patch,
+            _ if done > 0 && done < total => Next::Resume,
+            _ if total > 0 && done >= total => Next::Done,
+            _ => Next::Download,
+        }
     }
-    if let Some(id) = package.app {
-        app.push(format!("App {id}").into());
+
+    fn label(self) -> &'static str {
+        match self {
+            Next::Checking => "Checking…",
+            Next::Download | Next::Done => "Download",
+            Next::Patch => "Patch",
+            Next::Resume => "Resume",
+        }
     }
-    if let Some(build) = &package.build {
-        app.push(format!("Build {build}").into());
+}
+
+/// What a package with nothing to choose says: what to do next, given the main
+/// button and whether a `folder` is chosen. Nothing while a check or a
+/// download runs, or when everything is downloaded already.
+pub(crate) fn what_to_press(next: Next, folder: bool, downloading: bool) -> Option<&'static str> {
+    match next {
+        _ if downloading => None,
+        Next::Checking | Next::Done => None,
+        _ if !folder => Some("Choose a folder, then press Download."),
+        Next::Download => Some("Press Download to begin."),
+        Next::Patch => Some("Press Patch to begin."),
+        Next::Resume => Some("Press Resume to continue."),
     }
-    if !app.is_empty() {
-        ui.horizontal(|ui| {
-            for (index, part) in app.into_iter().enumerate() {
-                if index > 0 {
-                    ui.separator();
-                }
-                ui.label(part);
+}
+
+/// How a kind of tag is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Look {
+    /// A tile for each value, to click.
+    Tiles,
+    /// A boxed list of rows, with a mark for the one chosen or a box to
+    /// tick for each DLC.
+    List,
+}
+
+/// The kinds of tag shown and how each is drawn: tiles for a short choice,
+/// a list for a long one and for DLC. Every tile kind comes first, in the
+/// order of `Offer::selectors`, then every list, DLC last.
+pub(crate) fn arranged(offer: &Offer) -> Vec<(Selector, Look)> {
+    let look = |selector: &Selector| match selector {
+        Selector::Dlc => Look::List,
+        _ if offer.count(selector) >= LIST_FROM => Look::List,
+        _ => Look::Tiles,
+    };
+    let mut kinds: Vec<(Selector, Look)> = offer.selectors().into_iter().map(|selector| {
+        let look = look(&selector);
+        (selector, look)
+    }).collect();
+    kinds.sort_by_key(|(_, look)| *look == Look::List); // Stable, and DLC is last already.
+    kinds
+}
+
+/// Each kind of tag under its heading, and whether a choice changed. The
+/// kinds scroll as a whole when the window is too short for them; each list
+/// scrolls in its own box, which for the last takes the height left.
+fn selectors(ui: &mut egui::Ui, picker: &mut Picker, kinds: &[(Selector, Look)]) -> bool {
+    let room = ui.available_height(); // Inside the scroll area, there is no end to it.
+    let last = kinds.iter().rposition(|(_, look)| *look == Look::List);
+    let mut changed = false;
+    // The bar of the whole gets room of its own beside the kinds: floating
+    // over them, as the lists' own bars do, it would cover those.
+    let floating = std::mem::replace(&mut ui.spacing_mut().scroll, egui::style::ScrollStyle::solid());
+    egui::ScrollArea::vertical().id_salt("kinds").auto_shrink([false, true]).max_height(room).show(ui, |ui| {
+        ui.spacing_mut().scroll = floating;
+        let top = ui.cursor().top();
+        for (index, (selector, look)) in kinds.iter().enumerate() {
+            if index > 0 {
+                ui.add_space(14.0);
             }
-        });
+            changed |= match look {
+                Look::Tiles => tiles(ui, selector, picker),
+                Look::List => {
+                    let left = (Some(index) == last).then(|| room - (ui.cursor().top() - top));
+                    list(ui, selector, picker, left)
+                }
+            };
+        }
+    });
+    changed
+}
+
+/// The heading over a kind of tag: its label in capitals, and a weak note.
+fn heading(ui: &mut egui::Ui, label: &str, note: Option<&str>) {
+    ui.label(egui::RichText::new(label.to_uppercase()).size(14.0).extra_letter_spacing(0.7));
+    if let Some(note) = note {
+        ui.label(egui::RichText::new(note).size(13.0).weak());
     }
-    let height = ui.spacing().interact_size.y;
-    TableBuilder::new(ui)
-        .id_salt("depots")
-        .striped(true)
-        .cell_layout(egui::Layout::left_to_right(egui::Align::Center)) // Keeps labels on one line.
-        .columns(Column::auto(), 6)
-        .column(Column::remainder())
-        .header(height, |mut header| {
-            header.col(|ui| {
-                let mut all = skip.is_empty();
-                let toggle = ui.add_enabled(editable, egui::Checkbox::without_text(&mut all));
-                if toggle.on_hover_text("Tick or untick every depot").changed() {
-                    *skip = if all { BTreeSet::new() } else { package.depots.iter().map(|depot| depot.id).collect() };
+}
+
+/// A kind's values as tiles, up to four a line and all as wide, and whether
+/// one was chosen.
+fn tiles(ui: &mut egui::Ui, selector: &Selector, picker: &mut Picker) -> bool {
+    row(ui, egui::Align::Center, |ui| heading(ui, selector.label(), None));
+    ui.add_space(5.0);
+    let values = picker.offer.values(selector, &picker.choices);
+    let across = values.len().clamp(1, 4) as f32;
+    let width = ((ui.available_width() - TILE_GAP * (across - 1.0)) / across).floor();
+    let mut changed = false;
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(TILE_GAP, TILE_GAP);
+        for line in values.chunks(4) {
+            ui.horizontal(|ui| {
+                for value in line {
+                    if ui.add(tile(&value.name, value.chosen, width)).clicked() && !value.chosen {
+                        (picker.choices, changed) = (value.choices.clone(), true);
+                    }
                 }
             });
-            for heading in ["Depot", "Manifest", "Date", "Files", "Size", ""] {
-                header.col(|ui| _ = ui.strong(heading));
-            }
-        })
-        .body(|mut body| {
-            for depot in &package.depots {
-                body.row(height, |mut row| {
-                    row.col(|ui| {
-                        let mut wanted = !skip.contains(&depot.id);
-                        if ui.add_enabled(editable, egui::Checkbox::without_text(&mut wanted)).changed() {
-                            if wanted {
-                                skip.remove(&depot.id);
-                            } else {
-                                skip.insert(depot.id);
-                            }
-                        }
-                    });
-                    row.col(|ui| _ = ui.label(depot.id.to_string()).on_hover_ui(|ui| largest_files(ui, depot)));
-                    row.col(|ui| _ = ui.label(depot.manifest.to_string()));
-                    row.col(|ui| _ = ui.label(depot.created.map(download::date).unwrap_or_default()));
-                    row.col(|ui| _ = ui.label(depot.files().to_string()));
-                    row.col(|ui| _ = ui.label(download::human(depot.size())));
-                    let name = depot.name.as_deref().unwrap_or_default();
-                    row.col(|ui| _ = ui.label(name).on_hover_ui(|ui| largest_files(ui, depot)));
-                });
-            }
-            if package.depots.len() > 1 {
-                let chosen: Vec<_> = package.depots.iter().filter(|depot| !skip.contains(&depot.id)).collect();
-                body.row(height, |mut row| {
-                    row.col(|_| {});
-                    row.col(|ui| _ = ui.strong(if skip.is_empty() { "Total" } else { "Ticked" }));
-                    row.col(|_| {});
-                    row.col(|_| {});
-                    row.col(|ui| _ = ui.strong(chosen.iter().map(|depot| depot.files()).sum::<usize>().to_string()));
-                    row.col(|ui| _ = ui.strong(download::human(chosen.iter().map(|depot| depot.size()).sum())));
-                    row.col(|_| {});
-                });
-            }
-        });
+        }
+    });
+    changed
 }
 
-/// A depot's biggest files, which often show what it is for.
-fn largest_files(ui: &mut egui::Ui, depot: &depot::Depot) {
-    let mut files: Vec<_> = depot.entries.iter().filter(|entry| !entry.is_dir()).collect();
-    files.sort_by_key(|entry| std::cmp::Reverse(entry.size));
-    let mut text = format!("Depot {}, largest files:", depot.id);
-    for entry in files.iter().take(8) {
-        _ = write!(text, "\n{:>10}  {}", download::human(entry.size), entry.name);
+/// One value as a tile: lit with the accent colour when it is the one chosen.
+fn tile(text: &str, chosen: bool, width: f32) -> impl egui::Widget + '_ {
+    move |ui: &mut egui::Ui| {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(width, TILE_HEIGHT), egui::Sense::click());
+        response.widget_info(|| egui::WidgetInfo::selected(egui::Role::RadioButton, ui.is_enabled(), chosen, text));
+        if ui.is_rect_visible(rect) {
+            let (visuals, state) = (ui.visuals(), ui.style().interact(&response));
+            let ground = visuals.widgets.noninteractive.bg_fill;
+            let (fill, stroke, text) = if chosen {
+                let accent = visuals.selection.bg_fill;
+                (ground.lerp_to_gamma(accent, 0.25), egui::Stroke::new(1.5, accent.lerp_to_gamma(visuals.hyperlink_color, 0.5)),
+                 bold(text, 16.0))
+            } else {
+                let lift = if response.hovered() { 0.7 } else { 0.4 };
+                let stroke = if response.hovered() { state.bg_stroke } else { visuals.widgets.noninteractive.bg_stroke };
+                (ground.lerp_to_gamma(visuals.widgets.inactive.weak_bg_fill, lift), stroke, egui::RichText::new(text).size(16.0))
+            };
+            let galley = egui::WidgetText::from(text)
+                .into_galley(ui, Some(egui::TextWrapMode::Truncate), width - 24.0, egui::TextStyle::Button);
+            let painter = ui.painter();
+            painter.rect(rect, 8.0, fill, stroke, egui::StrokeKind::Inside);
+            painter.galley(rect.center() - galley.size() / 2.0, galley, visuals.widgets.inactive.text_color());
+        }
+        response
     }
-    ui.label(egui::RichText::new(text).monospace());
+}
+
+/// A kind's values, or the DLC, as a boxed list with a row for each and what
+/// choosing it adds, and whether the choice changed. A long list can be
+/// searched; DLC can also all be ticked or none. The box scrolls at
+/// `LIST_ROWS` rows, or if `fill` is given, at the height left of it.
+fn list(ui: &mut egui::Ui, selector: &Selector, picker: &mut Picker, fill: Option<f32>) -> bool {
+    let start = ui.cursor().top();
+    let dlc = *selector == Selector::Dlc;
+    let count = picker.offer.count(selector);
+    let values = picker.offer.values(selector, &picker.choices);
+    // "No extra" and "None" are not counted among the values.
+    let note = if dlc {
+        format!("{} of {count} chosen", count - picker.choices.without.len())
+    } else {
+        format!("{} to choose from", values.iter().filter(|value| !value.none).count())
+    };
+    let mut search = picker.search.remove(selector).unwrap_or_default();
+    let mut all = None;
+    row(ui, egui::Align::Center, |ui| {
+        heading(ui, selector.label(), Some(&note));
+        if count > 8 {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if dlc {
+                    if ui.button("None").clicked() {
+                        all = Some(false);
+                    }
+                    if ui.button("All").clicked() {
+                        all = Some(true);
+                    }
+                }
+                let field = egui::TextEdit::singleline(&mut search).hint_text("Search")
+                    .font(egui::FontId::proportional(14.0)).margin(egui::Margin::symmetric(10, 4));
+                ui.add(field.desired_width(230.0));
+            });
+        }
+    });
+    ui.add_space(5.0);
+    let wanted = search.trim().to_lowercase();
+    let found = |name: &str| wanted.is_empty() || name.to_lowercase().contains(&wanted);
+    let listed: Vec<(u32, String)> = if dlc {
+        picker.offer.dlc.iter().map(|&dlc| (dlc, picker.dlc_name(dlc))).filter(|(_, name)| found(name)).collect()
+    } else {
+        Vec::new()
+    };
+    let values: Vec<select::Value> = values.into_iter().filter(|value| found(&value.name)).collect();
+    picker.search.insert(selector.clone(), search);
+    let mut changed = false;
+    match all {
+        Some(true) => listed.iter().for_each(|(dlc, _)| _ = picker.choices.without.remove(dlc)),
+        Some(false) => picker.choices.without.extend(listed.iter().map(|(dlc, _)| dlc)),
+        None => {}
+    }
+    changed |= all.is_some();
+
+    let visuals = ui.visuals();
+    let frame = egui::Frame::new().fill(visuals.faint_bg_color).stroke(visuals.widgets.noninteractive.bg_stroke)
+        .corner_radius(8.0).inner_margin(egui::Margin::symmetric(0, 4));
+    let least = LIST_ROWS * ROW_HEIGHT;
+    let height = fill.map_or(least, |fill| (fill - (ui.cursor().top() - start) - frame.total_margin().sum().y).max(least));
+    frame.show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        // At least that tall if it has the rows for it, even where the window has
+        // less room left: then the kinds scroll as a whole.
+        let scroll = egui::ScrollArea::vertical().id_salt(("list", selector)).auto_shrink([false, true])
+            .max_height(height).min_scrolled_height(height);
+        let rows = if dlc { listed.len() } else { values.len() };
+        scroll.show_rows(ui, ROW_HEIGHT, rows, |ui, range| {
+            if dlc {
+                for (dlc, name) in &listed[range] {
+                    let ticked = !picker.choices.without.contains(dlc);
+                    let size = download::human(select::dlc_size(&picker.tags, &picker.sizes, &picker.choices, *dlc));
+                    if ui.add(list_row(Mark::Tick, ticked, name, Some(size))).clicked() {
+                        if ticked { picker.choices.without.insert(*dlc) } else { picker.choices.without.remove(dlc) };
+                        changed = true;
+                    }
+                }
+            } else {
+                for value in &values[range] {
+                    let size = (!value.none)
+                        .then(|| download::human(select::value_size(&picker.tags, &picker.sizes, &value.choices, selector)));
+                    if ui.add(list_row(Mark::Radio, value.chosen, &value.name, size)).clicked() && !value.chosen {
+                        (picker.choices, changed) = (value.choices.clone(), true);
+                    }
+                }
+            }
+        });
+    });
+    changed
+}
+
+/// The mark at the start of a list's row.
+#[derive(Clone, Copy)]
+enum Mark {
+    /// Round, for one of several.
+    Radio,
+    /// A box to tick.
+    Tick,
+}
+
+/// A row of a list: its mark, the name, and at the right what choosing it
+/// adds. The whole row can be clicked, the name too.
+fn list_row(mark: Mark, on: bool, name: &str, size: Option<String>) -> impl egui::Widget + '_ {
+    move |ui: &mut egui::Ui| {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), egui::Sense::click());
+        let role = match mark {
+            Mark::Radio => egui::Role::RadioButton,
+            Mark::Tick => egui::Role::CheckBox,
+        };
+        response.widget_info(|| egui::WidgetInfo::selected(role, ui.is_enabled(), on, name));
+        if ui.is_rect_visible(rect) {
+            let (visuals, state) = (ui.visuals(), ui.style().interact(&response));
+            let painter = ui.painter();
+            if response.hovered() {
+                painter.rect_filled(rect, 0.0, visuals.widgets.hovered.weak_bg_fill.gamma_multiply(0.25));
+            }
+            let inner = rect.shrink2(egui::vec2(16.0, 0.0));
+            let mark_rect = egui::Rect::from_center_size(egui::pos2(inner.left() + 8.0, rect.center().y), egui::vec2(16.0, 16.0));
+            let bright = visuals.strong_text_color();
+            match mark {
+                Mark::Radio => {
+                    painter.circle_filled(mark_rect.center(), 7.5, state.bg_fill);
+                    if on {
+                        painter.circle_filled(mark_rect.center(), 3.5, bright);
+                    }
+                }
+                Mark::Tick => {
+                    painter.rect_filled(mark_rect, 2.0, state.bg_fill);
+                    if on {
+                        let tick = mark_rect.shrink(3.5);
+                        let points = vec![egui::pos2(tick.left(), tick.center().y), egui::pos2(tick.center().x - 1.0, tick.bottom()),
+                                          tick.right_top()];
+                        painter.add(egui::Shape::line(points, egui::Stroke::new(2.0, bright)));
+                    }
+                }
+            }
+            let text = |text: String, wrap: egui::TextWrapMode, width: f32| {
+                egui::WidgetText::from(egui::RichText::new(text).size(15.0)).into_galley(ui, Some(wrap), width, egui::TextStyle::Body)
+            };
+            let size = size.map(|size| text(size, egui::TextWrapMode::Extend, f32::INFINITY));
+            let left = mark_rect.right() + 12.0;
+            let room = inner.right() - left - size.as_ref().map_or(0.0, |size| size.size().x + 16.0);
+            let name = text(name.to_string(), egui::TextWrapMode::Truncate, room.max(0.0));
+            let middle = |galley: &egui::Galley| rect.center().y - galley.size().y / 2.0;
+            painter.galley(egui::pos2(left, middle(&name)), name, visuals.widgets.inactive.text_color());
+            if let Some(size) = size {
+                painter.galley(egui::pos2(inner.right() - size.size().x, middle(&size)), size, visuals.text_color());
+            }
+        }
+        response
+    }
+}
+
+/// The drawings on the top bar's buttons.
+#[derive(Clone, Copy)]
+enum Icon {
+    /// Two arrows going round.
+    Update,
+    /// A terminal's prompt.
+    Log,
+}
+
+/// A small button with an icon drawn on it; `lit` fills it with the accent
+/// colour and adds an orange dot, for news.
+fn icon_button(icon: Icon, lit: bool) -> impl egui::Widget {
+    move |ui: &mut egui::Ui| {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 26.0), egui::Sense::click());
+        let name = match icon {
+            Icon::Update => "Updates",
+            Icon::Log => "Log",
+        };
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), name));
+        if ui.is_rect_visible(rect) {
+            let (visuals, state) = (ui.visuals(), ui.style().interact(&response));
+            let (fill, color) = match lit {
+                true if response.hovered() => (visuals.selection.bg_fill.lerp_to_gamma(egui::Color32::WHITE, 0.1), egui::Color32::WHITE),
+                true => (visuals.selection.bg_fill, egui::Color32::WHITE),
+                false => (state.weak_bg_fill, state.fg_stroke.color),
+            };
+            let painter = ui.painter();
+            painter.rect_filled(rect, 4.0, fill);
+            draw_icon(painter, icon, rect.center(), egui::Stroke::new(1.5, color));
+            if lit {
+                let orange = egui::Color32::from_rgb(0xff, 0x8f, 0x00);
+                painter.circle(rect.right_top() + egui::vec2(-3.5, 3.5), 4.5, orange, egui::Stroke::new(2.0, visuals.panel_fill));
+            }
+        }
+        response
+    }
+}
+
+/// Draw `icon` round `center`, 17 points across, from the drawing on a
+/// 20 by 20 grid that the mockups have.
+fn draw_icon(painter: &egui::Painter, icon: Icon, center: egui::Pos2, stroke: egui::Stroke) {
+    let scale = 17.0 / 20.0;
+    let at = |x: f32, y: f32| center + egui::vec2(x - 10.0, y - 10.0) * scale;
+    let line = |points: &[(f32, f32)]| painter.add(egui::Shape::line(points.iter().map(|&(x, y)| at(x, y)).collect(), stroke));
+    match icon {
+        Icon::Update => {
+            // Round the middle, clockwise, in degrees from the right.
+            let arc = |from: f32, to: f32| {
+                let points = (0..=16).map(|step| (from + (to - from) * step as f32 / 16.0).to_radians())
+                    .map(|angle| at(10.0 + 6.5 * angle.cos(), 10.0 + 6.5 * angle.sin())).collect();
+                painter.add(egui::Shape::line(points, stroke));
+            };
+            arc(0.0, 141.9); // From the right, under, to the lower left.
+            arc(180.0, 321.9); // From the left, over, to the upper right.
+            line(&[(15.6, 2.8), (15.6, 6.2), (12.2, 6.2)]);
+            line(&[(4.4, 17.2), (4.4, 13.8), (7.8, 13.8)]);
+        }
+        Icon::Log => {
+            painter.rect_stroke(egui::Rect::from_min_max(at(2.0, 3.5), at(18.0, 16.5)), 2.0 * scale, stroke, egui::StrokeKind::Middle);
+            line(&[(5.5, 8.0), (8.5, 10.3), (5.5, 12.6)]);
+            line(&[(10.5, 13.0), (14.5, 13.0)]);
+        }
+    }
+}
+
+/// The label of a path field, as wide as the other's, so that the fields line up.
+fn row_label(ui: &mut egui::Ui, label: &str) {
+    let width = ui.label(label).rect.width();
+    ui.add_space((LABEL - width).max(0.0));
+}
+
+/// A row of the depots window: a box to tick, the ID, the tags, the size.
+/// Hovering it shows the manifest, the package's comment on the depot, and
+/// every tag in full, as the row may have no room for them all.
+fn depot_row(ui: &mut egui::Ui, depot: &Depot, picker: &Picker, skip: &mut BTreeSet<u32>, editable: bool) {
+    let words = picker.tags.get(&depot.id).map(|tags| tags.words(|dlc| picker.dlc_name(dlc))).unwrap_or_default();
+    let height = ui.spacing().interact_size.y;
+    let layout = egui::Layout::left_to_right(egui::Align::Center);
+    let shown = ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), height), layout, |ui| {
+        let mut wanted = !skip.contains(&depot.id);
+        if ui.add_enabled(editable, egui::Checkbox::without_text(&mut wanted)).changed() {
+            if wanted { skip.remove(&depot.id) } else { skip.insert(depot.id) };
+        }
+        ui.allocate_ui_with_layout(egui::vec2(70.0, height), layout, |ui| ui.label(depot.id.to_string()));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(download::human(picker.sizes.get(&depot.id).copied().unwrap_or(0)));
+            ui.with_layout(layout, |ui| chips(ui, &words));
+        });
+    });
+    let comment = depot.name.as_ref().map(|name| format!("\n{name}")).unwrap_or_default();
+    let tags = if words.is_empty() { String::new() } else { format!("\n{}", words.join("\n")) };
+    shown.response.on_hover_text(format!("Manifest {}{comment}{tags}", depot.manifest));
+}
+
+/// Tags in small outlined chips, or a weak "no tags". A tag too long for the
+/// room left is cut short, and those there is no room for at all are counted.
+fn chips(ui: &mut egui::Ui, words: &[String]) {
+    if words.is_empty() {
+        ui.label(egui::RichText::new("no tags").size(12.0).weak());
+    }
+    let outline = ui.visuals().widgets.noninteractive.bg_stroke;
+    for (index, word) in words.iter().enumerate() {
+        let after = words.len() - index - 1;
+        // Keep room for the count, unless this is the last tag.
+        let room = ui.available_width() - if after > 0 { 40.0 } else { 0.0 };
+        if room < 60.0 {
+            ui.label(egui::RichText::new(format!("+{}", after + 1)).size(11.0).weak());
+            break;
+        }
+        let frame = egui::Frame::new().stroke(outline).corner_radius(9.0).inner_margin(egui::Margin::symmetric(7, 0));
+        frame.show(ui, |ui| {
+            ui.set_max_width(room - 16.0); // Less the chip's own margins.
+            ui.add(egui::Label::new(egui::RichText::new(word).size(11.0)).truncate())
+        });
+    }
+}
+
+#[cfg(test)]
+impl App {
+    pub fn looking_up_on(mirror: &str) -> Self {
+        App { mirror: mirror.into(), ..App::default() }
+    }
+
+    /// Open the package at `path`, as typing its path would.
+    pub fn open(&mut self, path: &Path) {
+        self.package = path.display().to_string();
+        self.read_info();
+    }
+
+    /// Take what the lookup found, and say whether it is still running.
+    pub fn collect_found(&mut self) -> bool {
+        self.collect_lookup(false);
+        self.picker.lookup.is_some()
+    }
+
+    pub fn record_name(&self) -> Option<String> {
+        self.picker.record.as_ref()?.name.clone()
+    }
+
+    pub fn skip(&self) -> &BTreeSet<u32> {
+        &self.skip
+    }
+}
+
+/// Every piece of text the window draws for `package`, given its app's
+/// `record` and the `names` of its DLC, in a window of 1000 by 700: for tests.
+#[cfg(test)]
+pub fn package_text(package: &Package, record: Option<Record>, names: &[(u32, &str)]) -> Vec<String> {
+    Drawn::new(package, record, names, 1000.0).texts()
+}
+
+/// How far right any text reaches when `package` is shown in a window `width` wide.
+#[cfg(test)]
+pub fn package_right_edge(package: &Package, record: Option<Record>, width: f32) -> f32 {
+    Drawn::new(package, record, &[], width).right_edge()
+}
+
+/// What the window shows of a package, drawn with no screen, which can be
+/// clicked: for tests. No folder is chosen.
+#[cfg(test)]
+pub struct Drawn {
+    ctx: egui::Context,
+    package: Package,
+    picker: Picker,
+    skip: BTreeSet<u32>,
+    width: f32,
+    /// How many frames have been drawn: each is a fifth of a second after
+    /// the last, so that what eases into place, as a scroll bar does, is there.
+    frames: u32,
+    /// The text the last frame drew, and where.
+    texts: Vec<(String, egui::Rect)>,
+}
+
+#[cfg(test)]
+impl Drawn {
+    pub fn new(package: &Package, record: Option<Record>, names: &[(u32, &str)], width: f32) -> Self {
+        let mut picker = Picker::new(package, None);
+        if record.is_some() {
+            picker.use_record(package, record);
+        }
+        picker.names.extend(names.iter().map(|(dlc, name)| (*dlc, name.to_string())));
+        let ctx = egui::Context::default();
+        set_fonts(&ctx);
+        let mut drawn = Drawn { ctx, package: package.clone(), skip: picker.skip(), picker, width, frames: 0, texts: Vec::new() };
+        for _ in 0..3 { // Some sizes take a frame to be known, and a scroll bar one more to take its room.
+            drawn.frame(Vec::new());
+        }
+        drawn
+    }
+
+    /// Draw a frame that takes `events`.
+    fn frame(&mut self, events: Vec<egui::Event>) {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(self.width, 700.0));
+        let time = Some(f64::from(self.frames) * 0.2);
+        self.frames += 1;
+        let input = egui::RawInput { screen_rect: Some(screen), events, time, ..Default::default() };
+        let press = what_to_press(Next::Download, false, false);
+        let mut output = self.ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                show_package(ui, &self.package, &mut self.picker, &mut self.skip, true, press);
+            });
+        });
+        output.textures_delta.clear(); // Nothing is painted, so the font texture goes nowhere.
+        self.texts = output.shapes.into_iter().filter_map(|clipped| match clipped.shape {
+            egui::Shape::Text(text) => Some((text.galley.text().to_string(), text.galley.rect.translate(text.pos.to_vec2()))),
+            _ => None,
+        }).collect();
+    }
+
+    pub fn texts(&self) -> Vec<String> {
+        self.texts.iter().map(|(text, _)| text.clone()).collect()
+    }
+
+    pub fn right_edge(&self) -> f32 {
+        self.texts.iter().map(|(_, rect)| rect.right()).fold(0.0, f32::max)
+    }
+
+    /// Click the text `text` where the last frame drew it, then draw again.
+    pub fn click(&mut self, text: &str) {
+        let at = self.texts.iter().find(|(drawn, _)| drawn == text).map(|(_, rect)| rect.center());
+        let at = at.unwrap_or_else(|| panic!("no {text:?} in {:?}", self.texts()));
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed,
+                                                            modifiers: egui::Modifiers::default() };
+        for events in [vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)], Vec::new()] {
+            self.frame(events);
+        }
+    }
+
+    pub fn choices(&self) -> &Choices {
+        &self.picker.choices
+    }
+
+    pub fn skip(&self) -> &BTreeSet<u32> {
+        &self.skip
+    }
 }

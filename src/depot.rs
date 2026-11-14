@@ -1,6 +1,6 @@
 //! Steam content formats: the package zip, depot manifests and CDN chunks.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Read};
 use std::path::Path;
 
@@ -79,6 +79,9 @@ pub struct Package {
     pub app_name: Option<String>,
     pub build: Option<String>,
     pub depots: Vec<Depot>,
+    /// Steam's records of apps that the package carries, as the mirror's
+    /// answers: the files `appinfo/<appid>.json`. Packages rarely have any.
+    pub records: BTreeMap<u32, String>,
     pub warnings: Vec<String>,
 }
 
@@ -90,8 +93,16 @@ impl Package {
             app_name: self.app_name.clone(),
             build: self.build.clone(),
             depots: self.depots.iter().filter(|depot| keep(depot.id)).cloned().collect(),
+            records: self.records.clone(),
             warnings: self.warnings.clone(),
         }
+    }
+
+    /// The build ID: the digits that start the `.lua` file's build comment,
+    /// as in "26326013 (public branch)".
+    pub fn build_id(&self) -> Option<u64> {
+        let build = self.build.as_deref()?;
+        build[..build.find(|c: char| !c.is_ascii_digit()).unwrap_or(build.len())].parse().ok()
     }
 }
 
@@ -123,7 +134,7 @@ pub fn read_package(path: &Path) -> Result<Package> {
     log::write(format!("package: {} bytes", data.len()));
     let mut archive = zip::ZipArchive::new(Cursor::new(data)).context("the package is not a zip file")?;
     let mut lua = String::new();
-    let mut manifests = Vec::new();
+    let (mut manifests, mut records) = (Vec::new(), BTreeMap::new());
     for index in 0..archive.len() {
         let mut item = archive.by_index(index).context("the package zip is damaged")?;
         let name = item.name().context("the package zip is damaged")?.to_ascii_lowercase();
@@ -136,6 +147,10 @@ pub fn read_package(path: &Path) -> Result<Package> {
             let mut bytes = Vec::new();
             item.read_to_end(&mut bytes).with_context(unreadable)?;
             manifests.push((name, bytes));
+        } else if let Some(app) = name.strip_prefix("appinfo/").and_then(|file| file.strip_suffix(".json")?.parse::<u32>().ok()) {
+            let mut record = String::new();
+            item.read_to_string(&mut record).with_context(unreadable)?;
+            records.insert(app, record);
         }
     }
     for line in lua.lines() {
@@ -145,7 +160,7 @@ pub fn read_package(path: &Path) -> Result<Package> {
     let mut keyed: Vec<_> = lua.keys.keys().collect();
     keyed.sort();
     log::write(format!("lua: build {:?}, keys for depots {keyed:?}", lua.build));
-    let mut package = Package { build: lua.build.take(), ..Package::default() };
+    let mut package = Package { build: lua.build.take(), records, ..Package::default() };
     for (name, bytes) in manifests {
         log::write(format!("package: parsing {name}"));
         let depot = parse_manifest(&bytes, &lua.keys, &mut package.warnings)

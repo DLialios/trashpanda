@@ -1,6 +1,6 @@
 //! Offline tests: formats, path safety, and full downloads against local servers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Write};
 use std::net::TcpListener;
@@ -1308,6 +1308,345 @@ fn window_icon_is_a_square_png() {
 }
 
 #[test]
+fn guesses_what_a_depot_is_for_from_its_file_names() {
+    use crate::glimpse::{self, Platform};
+    let systems = |files: &[&str]| {
+        const CONTENT: &[&[u8]] = &[b"content"];
+        let files: Vec<(&str, &[&[u8]])> = files.iter().map(|name| (*name, CONTENT)).collect();
+        glimpse::systems(&depot_of(1, &files, &mut HashMap::new()))
+    };
+    let windows = systems(&["Game_Data/level0", "Game_Data/Managed/Code.DLL", "UnityPlayer.dll", "Game.exe"]);
+    assert_eq!(windows, [Platform::Windows]);
+    // Unity's scripts are .dll files on every system.
+    let linux = systems(&["Game_Data/Managed/Code.dll", "Game.x86_64", "lib/libogg.so.0.8", "notes.so.txt"]);
+    assert_eq!(linux, [Platform::Linux]);
+    let mac = systems(&["Game.app/Contents/MacOS/Game", "Game.app/Contents/Frameworks/UnityPlayer.dylib",
+                        "Game.app/Contents/Resources/Data/Managed/Code.dll"]);
+    assert_eq!(mac, [Platform::Mac]);
+    // Proton: Windows programs and Linux libraries in one depot.
+    assert_eq!(systems(&["files/bin/wine64.exe", "files/lib/libwine.so"]), [Platform::Windows, Platform::Linux]);
+    assert_eq!(systems(&["bin/plugin.dll"]), [Platform::Windows]);
+    assert!(systems(&["pak0.pak", "readme.txt"]).is_empty());
+}
+
+/// over the hill's record, cut down: three systems, a redistributable
+/// borrowed from another app, a DLC, and keys that are not depots.
+const OVER_THE_HILL: &str = r#"{"status": "success", "data": {"2929250": {"appid": "2929250",
+    "common": {"name": "over the hill", "type": "Game"},
+    "depots": {
+        "228989": {"config": {"oslist": "windows"}, "depotfromapp": "228980", "sharedinstall": "1"},
+        "2929251": {"config": {"oslist": "windows"}, "manifests": {"public": {"gid": "349154354192562690", "size": "4851685702"}}},
+        "2929252": {"config": {"oslist": "linux"}},
+        "2929253": {"config": {"oslist": "macos"}},
+        "5208450": {"dlcappid": "5208450"},
+        "branches": {"public": {"buildid": "26489201", "timebuildupdated": "1793981763"},
+                     "public-beta": {"buildid": "26489201", "description": "Preview of upcoming updates."}},
+        "privatebranches": "1"}}}}"#;
+
+/// A record with every kind of tag, as `parse` reads them.
+const EVERY_TAG: &str = r#"{"status": "success", "data": {"100": {
+    "depots": {
+        "101": {},
+        "102": {"config": {"oslist": "windows,linux", "osarch": "64"}},
+        "103": {"config": {"oslist": "windows", "osarch": "32"}},
+        "104": {"config": {"language": "german"}},
+        "105": {"config": {"language": "english"}},
+        "106": {"config": {"lowviolence": "1"}},
+        "107": {"config": {"optionaldlc": "200", "oslist": "macos"}},
+        "108": {"dlcappid": "300"},
+        "109": {"dlcappid": "100"},
+        "110": {"config": {"oslist": ""}},
+        "baselanguages": "english,german",
+        "branches": {"public": {"buildid": "oops"}}}}}}"#;
+
+fn for_systems(systems: &[crate::glimpse::Platform]) -> crate::select::Tags {
+    crate::select::Tags { systems: systems.to_vec(), ..Default::default() }
+}
+
+#[test]
+fn reads_an_apps_record() {
+    use crate::appinfo::parse;
+    use crate::glimpse::Platform::{Linux, Mac, Windows};
+    use crate::select::Tags;
+    let record = parse(OVER_THE_HILL, 2929250).unwrap();
+    assert_eq!(record.name.as_deref(), Some("over the hill"));
+    assert_eq!(record.depots.keys().copied().collect::<Vec<_>>(), [228989, 2929251, 2929252, 2929253, 5208450]);
+    // A borrowed depot is tagged like any other; where it comes from is no tag.
+    assert_eq!(record.depots[&228989], for_systems(&[Windows]));
+    assert_eq!(record.depots[&2929253], for_systems(&[Mac]));
+    assert_eq!(record.depots[&5208450], Tags { dlc: Some(5208450), ..Tags::default() });
+    assert_eq!(record.dlc(&[2929251, 5208450, 99]), [5208450]);
+
+    let every = parse(EVERY_TAG, 100).unwrap();
+    assert_eq!(every.name, None);
+    let tag = |id: u32| every.depots[&id].clone();
+    assert_eq!(tag(101), Tags::default());
+    assert_eq!(tag(102), Tags { systems: vec![Windows, Linux], arch: Some("64".into()), ..Tags::default() });
+    assert_eq!(tag(104).language.as_deref(), Some("german"));
+    assert!(tag(106).low_violence);
+    assert_eq!(tag(107), Tags { systems: vec![Mac], dlc: Some(200), ..Tags::default() });
+    assert_eq!(tag(108).dlc, Some(300));
+    // Whoever has the app has its own ID, so that is no DLC.
+    assert_eq!(tag(109), Tags::default());
+    assert_eq!(tag(110), Tags::default());
+
+    // A DLC's record may have no `common`, or nothing at all, as 512031's does.
+    assert_eq!(parse(r#"{"status": "success", "data": {"512031": {"appid": "512031"}}}"#, 512031).unwrap().name, None);
+    assert!(parse(r#"{"data": {"512031": {}}, "status": "success"}"#, 512031).is_err());
+    assert!(parse(r#"{"status": "failed", "data": {}}"#, 7).is_err());
+    assert!(parse(OVER_THE_HILL, 7).is_err());
+    assert!(parse("<html>", 7).is_err());
+
+}
+
+#[test]
+fn chooses_depots_by_steams_rule() {
+    use crate::appinfo::parse;
+    use crate::glimpse::Platform::{Linux, Mac, Windows};
+    use crate::select::{Offer, Selector, chosen, skip};
+    let record = parse(EVERY_TAG, 100).unwrap();
+    let tags = record.depots.clone();
+    let offer = Offer::of(&tags);
+    assert_eq!(offer.systems, [Windows, Mac, Linux]);
+    assert_eq!(offer.archs, ["32", "64"]);
+    assert_eq!(offer.languages, ["german", "english"]);
+    assert_eq!(offer.dlc, [200, 300]);
+    assert_eq!(offer.selectors(), [Selector::System, Selector::Arch, Selector::Language, Selector::LowViolence,
+                                   Selector::Dlc]);
+
+    let start = offer.start(Some(Linux));
+    assert_eq!((start.system, start.arch.as_deref(), start.language.as_deref()), (Some(Linux), Some("64"), Some("english")));
+    assert!(!start.low_violence && start.without.is_empty());
+    // Untagged depots are always chosen; 102 runs on Linux too; 107 is for macOS.
+    assert_eq!(skip(&tags, &start), [103, 104, 106, 107].into());
+
+    let mut choices = start.clone();
+    choices.system = Some(Windows);
+    choices.arch = Some("32".into());
+    assert_eq!(skip(&tags, &choices), [102, 104, 106, 107].into());
+    choices.system = Some(Mac);
+    assert_eq!(skip(&tags, &choices), [102, 103, 104, 106].into());
+    choices.without.insert(200);
+    choices.without.insert(300);
+    assert_eq!(skip(&tags, &choices), [102, 103, 104, 106, 107, 108].into());
+    // No extra language leaves out every depot with one; low violence adds its depots to the rest.
+    let choices = crate::select::Choices { language: None, low_violence: true, ..start };
+    assert_eq!(skip(&tags, &choices), [103, 104, 105, 107].into());
+    for id in [101, 109, 110] {
+        assert!(chosen(&tags[&id], &crate::select::Choices::default()), "depot {id} has no tags");
+    }
+}
+
+#[test]
+fn a_kind_with_one_value_is_hidden_but_applies() {
+    use crate::glimpse::Platform::{Linux, Windows};
+    use crate::select::{Offer, Selector, Tags, skip};
+    // Bodycam: a game depot with no tags and two Windows redistributables,
+    // opened on Linux.
+    let tags = BTreeMap::from([(228989, for_systems(&[Windows])), (228990, for_systems(&[Windows])), (2406771, Tags::default())]);
+    let offer = Offer::of(&tags);
+    assert_eq!(offer.selectors(), []);
+    let start = offer.start(Some(Linux));
+    assert_eq!(start.system, Some(Windows));
+    assert!(skip(&tags, &start).is_empty());
+    // Only 64-bit: nothing else to choose, and the 64-bit depot stays.
+    let tags = BTreeMap::from([(1, Tags { arch: Some("64".into()), ..Tags::default() })]);
+    let offer = Offer::of(&tags);
+    assert_eq!(offer.selectors(), []);
+    assert!(skip(&tags, &offer.start(None)).is_empty());
+    // A language is shown however few there are, as "No extra" can be chosen instead.
+    let tags = BTreeMap::from([(1, Tags { language: Some("german".into()), ..Tags::default() }), (2, Tags::default())]);
+    let offer = Offer::of(&tags);
+    assert_eq!(offer.selectors(), [Selector::Language]);
+    // With no English, no extra language is chosen at first.
+    assert_eq!(skip(&tags, &offer.start(None)), [1].into());
+    // A system that is not here starts on the first, in the order Windows, macOS, Linux.
+    let tags = BTreeMap::from([(1, for_systems(&[Linux])), (2, for_systems(&[Windows]))]);
+    assert_eq!(Offer::of(&tags).start(None).system, Some(Windows));
+    assert_eq!(Offer::of(&tags).start(Some(Linux)).system, Some(Linux));
+}
+
+#[test]
+fn sizes_what_each_dlc_adds() {
+    use crate::glimpse::Platform::{Linux, Windows};
+    use crate::select::{Choices, Offer, Tags, dlc_size};
+    let tags = BTreeMap::from([
+        (1, Tags::default()),
+        (2, for_systems(&[Windows])),
+        (3, for_systems(&[Linux])),
+        (4, Tags { dlc: Some(9), ..for_systems(&[Linux]) }),
+        (5, Tags { dlc: Some(9), ..for_systems(&[Windows]) }),
+    ]);
+    let sizes = BTreeMap::from([(1, 1), (2, 10), (3, 100), (4, 1000), (5, 10000)]);
+    let mut choices = Offer::of(&tags).start(Some(Linux));
+    assert_eq!(dlc_size(&tags, &sizes, &choices, 9), 1000);
+    assert_eq!(dlc_size(&tags, &sizes, &Choices { system: Some(Windows), ..choices.clone() }, 9), 10000);
+    // What a DLC adds does not depend on whether it is ticked.
+    choices.without.insert(9);
+    assert_eq!(dlc_size(&tags, &sizes, &choices, 9), 1000);
+}
+
+#[test]
+fn works_out_systems_from_the_files_without_a_record() {
+    use crate::glimpse::Platform::{Linux, Windows};
+    use crate::select::{Offer, Selector, skip, tags};
+    let file = |name: &'static str| -> (&'static str, &'static [&'static [u8]]) { (name, &[b"content"]) };
+    let depots = [depot_of(1, &[file("Game.exe")], &mut HashMap::new()),
+                  depot_of(2, &[file("Game.x86_64")], &mut HashMap::new()),
+                  depot_of(3, &[file("data.pak")], &mut HashMap::new()),
+                  depot_of(4, &[file("bin/wine.exe"), file("lib/libwine.so")], &mut HashMap::new())];
+    let tags = tags(&depots, None);
+    assert_eq!(tags[&3], Default::default());
+    let offer = Offer::of(&tags);
+    assert_eq!(offer.systems, [Windows, Linux]);
+    assert_eq!(offer.selectors(), [Selector::System]);
+    assert_eq!(skip(&tags, &offer.start(Some(Linux))), [1].into());
+    assert_eq!(skip(&tags, &offer.start(Some(Windows))), [2].into());
+}
+
+#[test]
+fn reads_build_ids() {
+    let package = |build: Option<&str>| depot::Package { build: build.map(String::from), ..Default::default() };
+    assert_eq!(package(Some("26326013 (public branch)")).build_id(), Some(26326013));
+    assert_eq!(package(Some("26326013")).build_id(), Some(26326013));
+    assert_eq!(package(Some("public branch")).build_id(), None);
+    assert_eq!(package(None).build_id(), None);
+}
+
+/// A record for app `app` named `name`, with a depot `depot` of DLC `dlc`.
+fn record_json(app: u32, name: &str, depots: &[(u32, u32)]) -> String {
+    let depots: Vec<String> = depots.iter().map(|(depot, dlc)| format!(r#""{depot}": {{"dlcappid": "{dlc}"}}"#)).collect();
+    format!(r#"{{"status": "success", "data": {{"{app}": {{"common": {{"name": "{name}"}}, "depots": {{{}}}}}}}}}"#,
+            depots.join(", "))
+}
+
+#[test]
+fn looks_up_the_app_then_the_names_of_at_most_64_of_its_dlc() {
+    use crate::appinfo::{Found, Lookup};
+    let depots: Vec<(u32, u32)> = (0..70).map(|n| (1000 + n, 2000 + n)).collect();
+    let app = record_json(10, "Game", &depots);
+    let server = serve_with(move |path| match path {
+        "/10" => Reply::Body("200 OK", app.clone().into_bytes()),
+        "/2001" => Reply::Body("200 OK", br#"{"status": "success", "data": {"2001": {"appid": "2001"}}}"#.to_vec()),
+        "/2002" => Reply::Body("503 Unavailable", Vec::new()),
+        _ => {
+            let dlc = path.trim_start_matches('/');
+            Reply::Body("200 OK", record_json(dlc.parse().unwrap(), &format!("Pack {dlc}"), &[]).into_bytes())
+        }
+    });
+    // Only the DLC of depots in the package count.
+    let mut lookup = Lookup::start(&server.url, 10, depots.iter().map(|(depot, _)| *depot).chain([5]).collect());
+    let mut found = Vec::new();
+    let started = Instant::now();
+    while !lookup.is_done() {
+        assert!(started.elapsed() < Duration::from_secs(10), "the lookup never ended");
+        found.extend(lookup.found());
+        thread::sleep(Duration::from_millis(10));
+    }
+    let Some(Found::Record(Some(record))) = found.first() else { panic!("{found:?}") };
+    assert_eq!(record.name.as_deref(), Some("Game"));
+    let names: Vec<(u32, String)> =
+        found.iter().filter_map(|found| if let Found::Name(dlc, name) = found { Some((*dlc, name.clone())) } else { None }).collect();
+    // 2001 has no name and 2002 fails; both show as their ID.
+    assert_eq!(names.len(), 62);
+    assert_eq!(names[0], (2000, "Pack 2000".to_string()));
+    assert_eq!(names.last().unwrap().0, 2063);
+    assert_eq!(server.requests.lock().unwrap().len(), 65);
+}
+
+#[test]
+fn a_lookup_for_an_earlier_package_changes_nothing() {
+    let dir = TempDir::new("stale-lookup");
+    let package = |app: u32, depot: u32| {
+        let lua = format!("addappid({app}) -- Lua name {app}\naddappid({depot}, 1, \"{}\")\n", hex(&KEY));
+        let path = dir.0.join(format!("{app}.zip"));
+        let manifest_name = format!("{depot}_1.manifest");
+        fs::write(&path, zipped(&[("a.lua", lua.as_bytes()), (&manifest_name, &manifest_for_depot(depot.into()))])).unwrap();
+        path
+    };
+    let (first, second) = (package(10, 11), package(20, 21));
+    // The first app's record comes late, after the second's, and has a DLC to look up.
+    let server = serve_with(|path| match path {
+        "/10" => {
+            thread::sleep(Duration::from_millis(400));
+            Reply::Body("200 OK", record_json(10, "First", &[(11, 12)]).into_bytes())
+        }
+        "/20" => Reply::Body("200 OK", record_json(20, "Second", &[]).into_bytes()),
+        _ => Reply::Body("200 OK", record_json(12, "First's DLC", &[]).into_bytes()),
+    });
+    let mut app = crate::gui::App::looking_up_on(&server.url);
+    app.open(&first);
+    app.open(&second);
+    let started = Instant::now();
+    while app.collect_found() {
+        assert!(started.elapsed() < Duration::from_secs(10), "the lookup never ended");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(app.record_name().as_deref(), Some("Second"));
+    thread::sleep(Duration::from_millis(800)); // The first app's record has come by now.
+    app.collect_found();
+    assert_eq!(app.record_name().as_deref(), Some("Second"));
+    assert!(app.skip().is_empty());
+    // The first lookup stopped once its record came, without looking up the DLC.
+    let mut requests = server.requests.lock().unwrap().clone();
+    requests.sort();
+    assert_eq!(requests, ["/10", "/20"]);
+}
+
+#[test]
+fn the_window_shows_the_game_its_build_and_its_choices() {
+    let file = |name: &'static str| -> (&'static str, &'static [&'static [u8]]) { (name, &[b"content"]) };
+    let mut redist = depot_of(228989, &[file("vc_redist.exe")], &mut HashMap::new());
+    redist.name = Some("VC 2022 Redist (Shared from App 228980)".into());
+    let depots = vec![redist, depot_of(2929251, &[file("Game.exe")], &mut HashMap::new()),
+                      depot_of(2929252, &[file("Game.x86_64")], &mut HashMap::new()),
+                      depot_of(5208450, &[file("Supporter/art.png")], &mut HashMap::new())];
+    let package = depot::Package { app: Some(2929250), app_name: Some("over the hill (from the .lua)".into()),
+                                   build: Some("26326013 (public branch)".into()), depots, ..Default::default() };
+    let record = crate::appinfo::parse(OVER_THE_HILL, 2929250).unwrap();
+    let texts = crate::gui::package_text(&package, Some(record.clone()), &[(5208450, "over the hill - Supporter Edition")]);
+    let has = |texts: &[String], wanted: &str| texts.iter().any(|text| text == wanted);
+    for wanted in ["over the hill", "Build 26326013", "SYSTEM", "Windows", "Linux", "DLC", "1 of 1 chosen", "7 B",
+                   "over the hill - Supporter Edition"] {
+        assert!(has(&texts, wanted), "{wanted:?} in {texts:?}");
+    }
+    // Only the package's depots count, so there is no macOS; and no depot names.
+    for unwanted in ["macOS", "VC 2022 Redist (Shared from App 228980)", "over the hill (from the .lua)", "this computer",
+                     "Newer build"] {
+        assert!(!texts.iter().any(|text| text.contains(unwanted)), "{unwanted:?} in {texts:?}");
+    }
+
+    // Without the record: the .lua file's name, and systems from the files.
+    let texts = crate::gui::package_text(&package, None, &[]);
+    for wanted in ["over the hill (from the .lua)", "Build 26326013", "Windows", "Linux"] {
+        assert!(has(&texts, wanted), "{wanted:?} in {texts:?}");
+    }
+    assert!(!texts.iter().any(|text| text.contains("press Download")), "{texts:?}");
+    assert!(!texts.iter().any(|text| text.contains("Newer build") || text == "DLC"), "{texts:?}");
+
+    // One depot for one system: nothing to choose, so only what to do next, and nothing said of the system.
+    let only = depot::Package { depots: package.depots[1..2].to_vec(), ..package.clone() };
+    let texts = crate::gui::package_text(&only, Some(record.clone()), &[]);
+    let nothing = ["Choose a folder, then press Download."];
+    assert!(nothing.iter().all(|line| has(&texts, line)), "{texts:?}");
+    assert!(!["SYSTEM", "Windows", "Linux", "DLC"].iter().any(|word| has(&texts, word)), "{texts:?}");
+    // A depot with no tags at all: the same.
+    let plain = depot_of(77, &[file("data.pak")], &mut HashMap::new());
+    let texts = crate::gui::package_text(&depot::Package { depots: vec![plain], ..package.clone() }, Some(record), &[]);
+    assert!(nothing.iter().all(|line| has(&texts, line)) && !has(&texts, "SYSTEM"), "{texts:?}");
+
+    // Every kind of tag: tiles under a heading for each, and the DLC list.
+    let every = crate::appinfo::parse(EVERY_TAG, 100).unwrap();
+    let depots: Vec<_> = every.depots.keys().map(|&id| depot_of(id, &[file("x")], &mut HashMap::new())).collect();
+    let package = depot::Package { app: Some(100), depots, ..Default::default() };
+    let texts = crate::gui::package_text(&package, Some(every), &[]);
+    for wanted in ["App 100", "SYSTEM", "ARCHITECTURE", "32-bit", "64-bit", "LANGUAGE", "No extra", "German", "English",
+                   "LOW VIOLENCE", "Off", "On", "DLC", "2 of 2 chosen", "DLC 200", "DLC 300"] {
+        assert!(has(&texts, wanted), "{wanted:?} in {texts:?}");
+    }
+}
+
+#[test]
 fn tells_an_update_from_a_first_download() {
     let temp = TempDir::new("patch");
     let out = &temp.0;
@@ -1355,4 +1694,216 @@ fn tells_an_update_from_a_first_download() {
         updating(&v2)
     };
     assert!(old(&["game.bin", "gone.bin"]) && !old(&["game.bin"]));
+}
+
+#[test]
+fn a_narrow_window_wraps_the_title_and_the_buttons() {
+    let languages = ["polish", "german", "french", "russian", "japanese", "brazilian", "koreana", "schinese", "latam"];
+    let tagged: Vec<String> = languages.iter().enumerate()
+        .map(|(index, language)| format!(r#""{}":{{"config":{{"language":"{language}"}}}}"#, index + 1)).collect();
+    let json = format!(r#"{{"status":"success","data":{{"100":{{"common":{{"name":"A Game With Rather a Long Name: Remastered"}},
+        "depots":{{{},"20":{{"dlcappid":"200"}},"branches":{{"public":{{"buildid":"9","timebuildupdated":"1793981763"}}}}}}}}}}}}"#,
+                       tagged.join(","));
+    let record = crate::appinfo::parse(&json, 100).unwrap();
+    let depots: Vec<_> = record.depots.keys().map(|&id| depot_of(id, &[("x", &[b"content"])], &mut HashMap::new())).collect();
+    let package = depot::Package { app: Some(100), build: Some("1".into()), depots, ..Default::default() };
+    // Nothing may reach past the window: what is lined up on the right would be pushed out of it.
+    for width in [640.0, 1000.0] {
+        let edge = crate::gui::package_right_edge(&package, Some(record.clone()), width);
+        assert!(edge <= width, "text reaches {edge} in a window {width} wide");
+    }
+}
+
+#[test]
+fn offers_kinds_of_tag_it_does_not_know() {
+    use crate::select::{Choices, Offer, Selector, skip};
+    let json = r#"{"status": "success", "data": {"100": {"depots": {
+        "1": {}, "2": {"config": {"realm": "steamchina"}}, "3": {"config": {"oslist": "linux", "tier": "b"}},
+        "4": {"config": {"tier": "a"}}, "5": {"config": {"tier": ""}}}}}}"#;
+    let tags = crate::appinfo::parse(json, 100).unwrap().depots;
+    assert_eq!(tags[&3].other.iter().collect::<Vec<_>>(), [(&"tier".to_string(), &"b".to_string())]);
+    assert!(tags[&5].other.is_empty(), "an empty value is no tag");
+    assert_eq!(tags[&3].words(|dlc| dlc.to_string()), ["Linux", "tier: b"]);
+
+    // Each is a selector under Steam's own name for it, after the kinds known.
+    let offer = Offer::of(&tags);
+    // Depot 3 is the only one with a system, so there is no choice of system.
+    assert_eq!(offer.selectors(), [Selector::Other("realm".into()), Selector::Other("tier".into())]);
+    assert_eq!(Selector::Other("realm".into()).label(), "realm");
+    // One value is a switch that starts off; several are a choice that starts on the first.
+    let start = offer.start(None);
+    assert_eq!(start.other.iter().collect::<Vec<_>>(), [(&"tier".to_string(), &"a".to_string())]);
+    assert_eq!(skip(&tags, &start), [2, 3].into());
+    let other = [("realm", "steamchina"), ("tier", "b")].map(|(kind, value)| (kind.to_string(), value.to_string())).into();
+    assert_eq!(skip(&tags, &Choices { other, ..start.clone() }), [4].into());
+    assert_eq!(skip(&tags, &Choices { other: Default::default(), ..start }), [2, 3, 4].into());
+}
+
+#[test]
+fn a_package_that_carries_the_record_needs_no_mirror() {
+    let temp = TempDir::new("carried");
+    fs::create_dir_all(&temp.0).unwrap();
+    let record = r#"{"status": "success", "data": {"2862860": {"common": {"name": "Carried"}, "depots": {"123": {"dlcappid": "555"}}}}}"#;
+    let dlc = r#"{"status": "success", "data": {"555": {"common": {"name": "Carried DLC"}}}}"#;
+    let zip = |name: &str, record: &str| {
+        let path = temp.0.join(name);
+        fs::write(&path, zipped(&[("123.lua", lua(&[(123, KEY)]).as_bytes()), ("123_1.manifest", &manifest_for_depot(123)),
+                                  ("appinfo/2862860.json", record.as_bytes()), ("AppInfo/555.json", dlc.as_bytes()),
+                                  ("appinfo/notes.json", b"{}")])).unwrap();
+        path
+    };
+    let (good, bad) = (zip("good.zip", record), zip("bad.zip", "<html>"));
+    let package = depot::read_package(&good).unwrap();
+    assert_eq!(package.records.keys().copied().collect::<Vec<_>>(), [555, 2862860]);
+    let (carried, names) = crate::appinfo::bundled(&package).unwrap();
+    assert_eq!((carried.name.as_deref(), names.get(&555).map(String::as_str)), (Some("Carried"), Some("Carried DLC")));
+
+    let server = serve_with(|_| Reply::Body("200 OK", record_json(2862860, "From the mirror", &[]).into_bytes()));
+    let mut window = crate::gui::App::looking_up_on(&server.url);
+    window.open(&good);
+    assert!(!window.collect_found(), "no lookup runs");
+    assert_eq!(window.record_name().as_deref(), Some("Carried"));
+    assert!(server.requests.lock().unwrap().is_empty(), "the mirror is not asked");
+
+    // A record that is no use is passed over, and the mirror asked after all.
+    window.open(&bad);
+    let started = Instant::now();
+    while window.collect_found() {
+        assert!(started.elapsed() < Duration::from_secs(10), "the lookup never ended");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(window.record_name().as_deref(), Some("From the mirror"));
+}
+
+#[test]
+fn draws_a_short_choice_as_tiles_and_a_long_one_as_a_list() {
+    use crate::glimpse::Platform::{Linux, Windows};
+    use crate::gui::{Look, arranged};
+    use crate::select::{Offer, Selector};
+    let values = |count: usize| (0..count).map(|n| format!("v{n:02}")).collect::<Vec<_>>();
+    let look = |offer: &Offer, selector: &Selector| arranged(offer).into_iter().find(|(shown, _)| shown == selector).map(|(_, look)| look);
+    // "None" counts: 10 values and None are 11 tiles, 11 values and None a list of 12.
+    for (count, wanted) in [(10, Look::Tiles), (11, Look::List)] {
+        let offer = Offer { other: [("tier".to_string(), values(count))].into(), ..Offer::default() };
+        assert_eq!(offer.count(&Selector::Other("tier".into())), count + 1);
+        assert_eq!(look(&offer, &Selector::Other("tier".into())), Some(wanted), "{count} values");
+        // So does "No extra".
+        let offer = Offer { languages: values(count), ..Offer::default() };
+        assert_eq!(look(&offer, &Selector::Language), Some(wanted), "{count} languages");
+    }
+    // DLC is a list however few there are.
+    let offer = Offer { systems: vec![Windows, Linux], dlc: vec![7], ..Offer::default() };
+    assert_eq!(arranged(&offer), [(Selector::System, Look::Tiles), (Selector::Dlc, Look::List)]);
+
+    // Every tile kind first, then the lists, DLC last.
+    let offer = Offer { systems: vec![Windows, Linux], archs: values(2), languages: values(15), low_violence: true,
+                        other: [("a".to_string(), values(40)), ("b".to_string(), values(3))].into(), dlc: vec![7, 8] };
+    let kinds: Vec<Selector> = arranged(&offer).into_iter().map(|(selector, _)| selector).collect();
+    assert_eq!(kinds, [Selector::System, Selector::Arch, Selector::LowViolence, Selector::Other("b".into()),
+                       Selector::Language, Selector::Other("a".into()), Selector::Dlc]);
+}
+
+#[test]
+fn sizes_what_each_value_adds() {
+    use crate::glimpse::Platform::{Linux, Windows};
+    use crate::select::{Offer, Selector, Tags, value_size};
+    let language = |code: &str| Some(code.to_string());
+    let tags = BTreeMap::from([
+        (1, Tags::default()),
+        (2, Tags { language: language("german"), ..Tags::default() }),
+        (3, Tags { language: language("english"), ..Tags::default() }),
+        (4, Tags { language: language("english"), ..for_systems(&[Linux]) }),
+        (5, Tags { language: language("english"), ..for_systems(&[Windows]) }),
+        (6, Tags { language: language("german"), dlc: Some(9), ..Tags::default() }),
+    ]);
+    let sizes = BTreeMap::from([(1, 1), (2, 10), (3, 100), (4, 1000), (5, 10000), (6, 100000)]);
+    let offer = Offer::of(&tags);
+    let mut choices = offer.start(Some(Linux));
+    let sized = |choices: &crate::select::Choices, selector: &Selector| -> Vec<(String, bool, u64)> {
+        offer.values(selector, choices).into_iter()
+            .map(|value| (value.name.clone(), value.chosen, value_size(&tags, &sizes, &value.choices, selector))).collect()
+    };
+    // Each under the other choices: English on Linux leaves out the Windows depot.
+    assert_eq!(sized(&choices, &Selector::Language),
+               [("No extra".into(), false, 0), ("German".into(), false, 100010), ("English".into(), true, 1100)]);
+    // A DLC left out adds nothing to its language.
+    choices.without.insert(9);
+    assert_eq!(sized(&choices, &Selector::Language)[1], ("German".into(), false, 10));
+    // A system adds the depots only for it.
+    assert_eq!(sized(&choices, &Selector::System), [("Windows".into(), false, 10000), ("Linux".into(), true, 1000)]);
+}
+
+#[test]
+fn says_what_to_press_when_there_is_nothing_to_choose() {
+    use crate::gui::{Next, what_to_press};
+    assert_eq!(what_to_press(Next::of(false, false, 0, 0), false, false), Some("Choose a folder, then press Download."));
+    assert_eq!(what_to_press(Next::of(false, false, 0, 10), true, false), Some("Press Download to begin."));
+    assert_eq!(what_to_press(Next::of(false, false, 10, 10), true, false), None, "it is all there already");
+    assert_eq!(what_to_press(Next::of(false, true, 4, 10), true, false), Some("Press Patch to begin."));
+    assert_eq!(what_to_press(Next::of(false, false, 4, 10), true, false), Some("Press Resume to continue."));
+    // Nothing while a check or a download runs.
+    assert_eq!(Next::of(true, true, 4, 10), Next::Checking);
+    assert_eq!(what_to_press(Next::Checking, true, false), None);
+    assert_eq!(what_to_press(Next::Resume, true, true), None);
+}
+
+#[test]
+fn a_tile_a_round_row_and_a_tick_each_change_the_choice() {
+    use crate::glimpse::Platform::{Linux, Windows};
+    let languages = ["german", "french", "italian", "spanish", "russian", "polish", "dutch", "danish", "czech", "greek",
+                     "thai"];
+    let mut depots: Vec<String> = languages.iter().enumerate()
+        .map(|(index, language)| format!(r#""{}":{{"config":{{"language":"{language}"}}}}"#, index + 1)).collect();
+    depots.extend([r#""20":{"config":{"oslist":"windows"}}"#.to_string(), r#""21":{"config":{"oslist":"linux"}}"#.into(),
+                   r#""22":{"dlcappid":"200"}"#.into()]);
+    let json = format!(r#"{{"status":"success","data":{{"100":{{"common":{{"name":"Clicks"}},"depots":{{{}}}}}}}}}"#,
+                       depots.join(","));
+    let record = crate::appinfo::parse(&json, 100).unwrap();
+    let ids: Vec<u32> = record.depots.keys().copied().collect();
+    let depots = ids.iter().map(|&id| depot_of(id, &[("x", &[b"content"])], &mut HashMap::new())).collect();
+    let package = depot::Package { app: Some(100), depots, ..Default::default() };
+    let mut window = crate::gui::Drawn::new(&package, Some(record), &[(200, "Clicks - Extras")], 1000.0);
+    let texts = window.texts();
+    for wanted in ["SYSTEM", "LANGUAGE", "11 to choose from", "No extra", "German", "7 B", "DLC", "1 of 1 chosen",
+                   "Clicks - Extras"] {
+        assert!(texts.iter().any(|text| text == wanted), "{wanted:?} in {texts:?}");
+    }
+
+    // A tile.
+    let other = if window.choices().system == Some(Linux) { Windows } else { Linux };
+    window.click(other.name());
+    assert_eq!(window.choices().system, Some(other));
+    // A round row: the list starts on No extra, as there is no English.
+    assert_eq!(window.choices().language, None);
+    window.click("German");
+    assert_eq!(window.choices().language.as_deref(), Some("german"));
+    assert!(!window.skip().contains(&1) && window.skip().contains(&2));
+    // A box to tick, by its name.
+    window.click("Clicks - Extras");
+    assert!(window.choices().without.contains(&200) && window.skip().contains(&22));
+    assert!(window.texts().iter().any(|text| text == "0 of 1 chosen"));
+    window.click("Clicks - Extras");
+    assert!(window.choices().without.is_empty() && !window.skip().contains(&22));
+}
+
+#[test]
+fn long_lists_keep_their_rows_and_their_scroll_bars_clear_of_the_windows() {
+    // Two lists too long to both fit: each keeps its ten rows, so the kinds scroll as a whole.
+    let languages: Vec<String> = (1..=15).map(|n| format!(r#""{n}": {{"config": {{"language": "lang{n:02}"}}}}"#)).collect();
+    let dlc: Vec<String> = (1..=30).map(|n| format!(r#""{}": {{"dlcappid": "{}"}}"#, 100 + n, 500 + n)).collect();
+    let json = format!(r#"{{"status": "success", "data": {{"7": {{"depots": {{{}, {}}}}}}}}}"#, languages.join(", "), dlc.join(", "));
+    let record = crate::appinfo::parse(&json, 7).unwrap();
+    let depots: Vec<_> = record.depots.keys().map(|&id| depot_of(id, &[("x", &[b"content"])], &mut HashMap::new())).collect();
+    let package = depot::Package { app: Some(7), depots, ..Default::default() };
+    let drawn = crate::gui::Drawn::new(&package, Some(record.clone()), &[], 1000.0);
+    let texts = drawn.texts();
+    for row in ["No extra", "lang09", "DLC 501"] {
+        assert!(texts.iter().any(|text| text == row), "{row:?} in {texts:?}");
+    }
+    // The bar that scrolls them as a whole has room of its own at the right,
+    // so the lists, and the bars inside them, end short of it.
+    // The DLC alone fit, and their All and None buttons reach the edge.
+    let alone = depot::Package { depots: package.depots.iter().filter(|depot| depot.id > 100).cloned().collect(), ..package.clone() };
+    let (both, one) = (drawn.right_edge(), crate::gui::Drawn::new(&alone, Some(record), &[], 1000.0).right_edge());
+    assert!(one - both >= 8.0, "text reaches {both} with the bar and {one} without");
 }

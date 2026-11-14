@@ -50,6 +50,41 @@ September to November 2026 was 69.6 GiB in all, with 22.2 GiB still in place,
 all chunks are exactly 1 MiB; only the last of a file, or one beside a change,
 is smaller.
 
+## How Steam picks depots
+
+Steam does not guess which depots an install needs. The developer tags each
+depot in the app's record (its appinfo), and the client downloads every depot
+whose tags all fit the install. Only six kinds of tag occur, all under the
+depot's `config` except `dlcappid`, and every value is a string:
+
+| Tag | Values | Fits when |
+| --- | --- | --- |
+| `oslist` | `windows`, `macos`, `linux`, comma-separated | it lists the install's system |
+| `osarch` | `32` or `64` | it equals the install's architecture |
+| `language` | a Steam language code: `german`, `koreana`, `schinese` | it equals the install's language |
+| `lowviolence` | `1` | the install wants low violence |
+| `dlcappid`, `optionaldlc` | a DLC's app ID | the account has that DLC |
+
+A tag that is absent fits everyone, so a depot without tags is installed for
+everyone: Bodycam's 69 GiB game depot has none. Values and depots can still
+run to the thousands: Train Simulator's record lists 1,326 depots for 1,320
+DLC. `depotfromapp` marks a depot borrowed from another app, such as
+`228989` (VC 2022 Redist) from `228980`; it is not a tag. The record's
+`depots` map also holds keys that are not depots (`branches`,
+`privatebranches`, `baselanguages`, ...); only all-digit keys are depots.
+`depots.branches.public` gives the newest public `buildid` and its
+`timebuildupdated` (Unix time). A DLC app's record has its own
+`common.name` and no depots, and some have nothing at all (Civilization VI's
+512031).
+
+**The record is not in the package.** The package holds only keys and
+manifests, though this program also reads a package that carries the mirror's
+answers as `appinfo/<appid>.json`, and then asks no one. Steam serves the record over its own client protocol (PICS), not
+plain HTTP; `https://api.steamcmd.net/v1/info/<appid>` is a third-party mirror that
+serves it as JSON to anyone, `{"status": "success", "data": {"<appid>": {...}}}`.
+Without the record, the systems a depot is for can only be guessed from the
+names of its programs and libraries (`.exe`, `.so`, `.dylib`, ...).
+
 ## What a download needs
 
 Strictly, two things: the **depot key** and the **manifest file**. Everything
