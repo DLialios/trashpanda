@@ -293,12 +293,28 @@ fn reads_keys_and_names_from_lua() {
     let lua = depot::parse_lua(&text);
     assert_eq!(lua.keys.len(), 3);
     assert_eq!((lua.keys[&2862861], lua.keys[&228989], lua.keys[&5]), (KEY, [0xab; 32], [1; 32]));
-    assert_eq!((lua.app, lua.app_name.as_deref()), (Some(2862860), Some("the app")));
+    assert_eq!(lua.app(&[]), Some((2862860, Some("the app".to_string()))));
     assert_eq!(lua.build.as_deref(), Some("26508517 (public branch)"));
     // "Depot <id>" says nothing the ID does not.
     assert_eq!(lua.names, HashMap::from([(5, "VC 2022 Redist".to_string())]));
-    let bad = depot::parse_lua("addappid(5, 1, \"abc\")");
-    assert!(bad.keys.is_empty() && bad.app.is_none());
+    let bad = depot::parse_lua("addappid(5, 1, \"abc\")\naddappid(x)");
+    assert!(bad.keys.is_empty() && bad.added == [(5, None)]);
+}
+
+#[test]
+fn finds_the_app_whether_or_not_its_line_has_a_key() {
+    let depot = |id| depot::parse_manifest(&manifest_for_depot(id), &HashMap::from([(id as u32, KEY)]), &mut Vec::new());
+    let depots = [depot(11).unwrap().unwrap(), depot(30).unwrap().unwrap()];
+    let (key, game) = (hex(&KEY), Some((10, Some("Game".to_string()))));
+    // The app's line has a key, and the only line without one is a DLC's.
+    let keyed = format!("addappid(10, 1, \"{key}\") -- Game\naddappid(11, 1, \"{key}\") -- Depot 11\n\
+                         addappid(30)\naddappid(30, 1, \"{key}\") -- Game - DLC - Depot 30\n");
+    assert_eq!(depot::parse_lua(&keyed).app(&depots), game);
+    // Depots listed before the app are not taken for it.
+    let late = format!("addappid(11, 1, \"{key}\") -- Base\naddappid(10) -- Game\n");
+    assert_eq!(depot::parse_lua(&late).app(&depots), game);
+    // A file that adds only depots names no app.
+    assert_eq!(depot::parse_lua(&format!("addappid(11, 1, \"{key}\") -- Base\n")).app(&depots), None);
 }
 
 #[test]

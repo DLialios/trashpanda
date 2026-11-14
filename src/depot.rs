@@ -73,7 +73,7 @@ impl Depot {
 
 #[derive(Clone, Default)]
 pub struct Package {
-    /// The app ID, from `addappid(<app>)` in the `.lua` file.
+    /// The app ID: the first ID the `.lua` file adds that is not a depot here.
     pub app: Option<u32>,
     /// The app's name and build, from the `.lua` file's comments if it has them.
     pub app_name: Option<String>,
@@ -98,12 +98,21 @@ impl Package {
 /// What a package's `.lua` file says.
 #[derive(Default)]
 pub struct Lua {
-    pub app: Option<u32>,
-    pub app_name: Option<String>,
+    /// Every ID the file adds, in its order, with the comment naming it.
+    pub added: Vec<(u32, Option<String>)>,
     pub build: Option<String>,
     pub keys: HashMap<u32, Key>,
     /// Comments naming depots.
     pub names: HashMap<u32, String>,
+}
+
+impl Lua {
+    /// The app and its name: the first ID the file adds that is not one of
+    /// `depots`. The app's line may carry a key like a depot's, so only a
+    /// manifest tells the two apart.
+    pub fn app(&self, depots: &[Depot]) -> Option<(u32, Option<String>)> {
+        self.added.iter().find(|(id, _)| !depots.iter().any(|depot| depot.id == *id)).cloned()
+    }
 }
 
 /// Read a package zip holding a `.lua` file with depot keys and the
@@ -135,9 +144,8 @@ pub fn read_package(path: &Path) -> Result<Package> {
     let mut lua = parse_lua(&lua);
     let mut keyed: Vec<_> = lua.keys.keys().collect();
     keyed.sort();
-    log::write(format!("lua: app {:?}, name {:?}, build {:?}, keys for depots {keyed:?}",
-                       lua.app, lua.app_name, lua.build));
-    let mut package = Package { app: lua.app, app_name: lua.app_name, build: lua.build, ..Package::default() };
+    log::write(format!("lua: build {:?}, keys for depots {keyed:?}", lua.build));
+    let mut package = Package { build: lua.build.take(), ..Package::default() };
     for (name, bytes) in manifests {
         log::write(format!("package: parsing {name}"));
         let depot = parse_manifest(&bytes, &lua.keys, &mut package.warnings)
@@ -150,6 +158,10 @@ pub fn read_package(path: &Path) -> Result<Package> {
             None => package.warnings.push(format!("Skipping {name}: no key for its depot")),
         }
     }
+    if let Some((app, name)) = lua.app(&package.depots) {
+        log::write(format!("package: app {app}, name {name:?}"));
+        (package.app, package.app_name) = (Some(app), name);
+    }
     for warning in &package.warnings {
         log::write(format!("package: warning: {warning}"));
     }
@@ -157,10 +169,10 @@ pub fn read_package(path: &Path) -> Result<Package> {
     Ok(package)
 }
 
-/// Read depot keys from lines like `addappid(2862861, 1, "<64 hex digits>")`
-/// and the app from the first `addappid(2862860)`. Comments after those calls
-/// name the app or depot, and a `-- Build: ...` comment gives the build; both
-/// are optional.
+/// Read depot keys from lines like `addappid(2862861, 1, "<64 hex digits>")`,
+/// and every ID added, one of which is the app: `addappid(2862860)`, with or
+/// without a key. Comments after those calls name the app or depot, and a
+/// `-- Build: ...` comment gives the build; both are optional.
 pub fn parse_lua(text: &str) -> Lua {
     let mut lua = Lua::default();
     for line in text.lines() {
@@ -174,15 +186,12 @@ pub fn parse_lua(text: &str) -> Lua {
             let Ok(id) = args[0].parse::<u32>() else { continue };
             // Some generators label each depot with just "Depot <id>".
             let name = Some(comment.to_string()).filter(|c| !c.is_empty() && *c != format!("Depot {id}"));
-            match args.as_slice() {
-                [_] if lua.app.is_none() => (lua.app, lua.app_name) = (Some(id), name),
-                [_, _, key, ..] => {
-                    if let Some(key) = parse_key(key.trim_matches(['"', '\''])) {
-                        lua.keys.insert(id, key);
-                        lua.names.extend(name.map(|name| (id, name)));
-                    }
-                }
-                _ => {}
+            lua.added.push((id, name.clone()));
+            if let [_, _, key, ..] = args.as_slice()
+                && let Some(key) = parse_key(key.trim_matches(['"', '\'']))
+            {
+                lua.keys.insert(id, key);
+                lua.names.extend(name.map(|name| (id, name)));
             }
         }
     }
