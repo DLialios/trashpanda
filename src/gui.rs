@@ -354,7 +354,9 @@ impl App {
             ui.add_space(8.0);
             row(ui, egui::Align::Center, |ui| {
                 let (done, total) = (download::human(done), download::human(total));
-                ui.label(egui::RichText::new(format!("{done} of {total}   ·   {}", rates.speed_text())).size(16.0).weak());
+                // Before it downloads, it copies what an older version has in other places.
+                let pace = if self.progress.local.load(Relaxed) { "using what is already here".into() } else { rates.speed_text() };
+                ui.label(egui::RichText::new(format!("{done} of {total}   ·   {pace}")).size(16.0).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let pausing = self.progress.stop.load(Relaxed);
                     if big_button(ui, if pausing { "Pausing…" } else { "Pause" }, false, !pausing).clicked() {
@@ -370,9 +372,14 @@ impl App {
         let chosen = package.iter().flat_map(|package| &package.depots).filter(|depot| !self.skip.contains(&depot.id));
         let size = chosen.map(depot::Depot::size).reduce(|a, b| a + b); // None when no depot is ticked.
         let no_output = self.output.trim().is_empty();
+        // What an older version has in other places is copied, not downloaded.
+        let elsewhere = self.progress.elsewhere.load(Relaxed);
         let (amount, note) = match size {
+            _ if started && elsewhere > 0 => (percent, format!("downloaded\n{} of {}\nand {} more only has to be moved",
+                                                               download::human(done), download::human(total),
+                                                               download::human(elsewhere))),
             _ if started => (percent, format!("downloaded\n{} of {}", download::human(done), download::human(total))),
-            Some(size) => (download::human(size), "to download".into()),
+            Some(size) => (download::human(size.saturating_sub(elsewhere)), "to download".into()),
             None => (String::new(), String::new()),
         };
         row(ui, egui::Align::Center, |ui| {

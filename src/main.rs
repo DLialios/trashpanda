@@ -6,6 +6,7 @@ mod download;
 mod gui;
 mod installed;
 mod log;
+mod moved;
 #[cfg(test)]
 mod tests;
 mod update;
@@ -30,9 +31,10 @@ Usage: trashpanda PACKAGE.zip [-o DIR] [-j N] [-d ID,ID...] [-l] [--log FILE]
 Downloads every depot in PACKAGE.zip (a .lua file with depot keys plus the
 depots' .manifest files) into the current directory. Run it again to resume:
 chunks already on disk are checked and kept, so it also repairs damaged files.
-A package of a newer version updates the same directory in place, and removes
-the files the new version dropped; .trashpanda-installed.json lists the files
-this program put there, and nothing else is ever removed.
+A package of a newer version updates the same directory in place: content the
+new version only moved is copied rather than downloaded, and the files it
+dropped are removed. .trashpanda-installed.json lists the files this program
+put there, and nothing else is ever removed.
 
   -o, --output DIR      download into DIR instead of the current directory
   -j, --jobs N          parallel chunk downloads (default 16)
@@ -192,8 +194,11 @@ fn status_line(progress: &Progress, meter: &mut Meter) -> String {
     let filled = ((percent / 5.0) as usize).min(20);
     let done = progress.done.load(Relaxed) as f64 / f64::from(1 << 30);
     let total = progress.total.load(Relaxed) as f64 / f64::from(1 << 30);
-    format!("[{}{}] {percent:5.1}%  {done:.1}/{total:.1} GiB  {}  {} left",
-            "#".repeat(filled), "-".repeat(20 - filled), rates.speed_text(), rates.left_text())
+    let pace = match progress.local.load(Relaxed) {
+        true => "using what is already here".into(),
+        false => format!("{}  {} left", rates.speed_text(), rates.left_text()),
+    };
+    format!("[{}{}] {percent:5.1}%  {done:.1}/{total:.1} GiB  {pace}", "#".repeat(filled), "-".repeat(20 - filled))
 }
 
 /// A double-clicked Windows program gets a console window of its own; close

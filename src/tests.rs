@@ -16,7 +16,7 @@ use sha1::{Digest, Sha1};
 
 use crate::depot::{self, Key};
 use crate::download::{self, Meter, Progress, Rates};
-use crate::{installed, update};
+use crate::{installed, moved, update};
 
 const KEY: Key = [7; 32];
 const IV: [u8; 16] = [9; 16];
@@ -33,6 +33,10 @@ fn varint(mut value: u64) -> Vec<u8> {
 
 fn int(number: u32, value: u64) -> Vec<u8> {
     [varint(u64::from(number) << 3), varint(value)].concat()
+}
+
+fn fixed32(number: u32, value: u32) -> Vec<u8> {
+    [varint(u64::from(number) << 3 | 5), value.to_le_bytes().to_vec()].concat()
 }
 
 fn bytes(number: u32, value: &[u8]) -> Vec<u8> {
@@ -275,7 +279,7 @@ fn decodes_each_chunk_format_and_checks_it() {
     }
     let encrypted = encrypt(&compressed(&data, "zstd"));
     assert!(depot::decrypt(&encrypted, &[0; 32]).is_err());
-    let chunk = depot::Chunk { sha: Sha1::digest(&data).into(), offset: 0, size: data.len() as u32 };
+    let chunk = depot::Chunk { sha: Sha1::digest(&data).into(), sum: 0, offset: 0, size: data.len() as u32 };
     assert_eq!(depot::decode_chunk(&encrypted, &KEY, &chunk).unwrap(), data);
     let wrong = depot::Chunk { sha: [1; 20], ..chunk };
     assert!(depot::decode_chunk(&encrypted, &KEY, &wrong).unwrap_err().to_string().contains("SHA-1"));
@@ -568,7 +572,8 @@ fn depot_of(id: u32, files: &[(&str, &[&[u8]])], responses: &mut HashMap<String,
         let mut offset = 0;
         for part in *parts {
             let sha = Sha1::digest(part);
-            mapping.extend(bytes(6, &[bytes(1, &sha), int(3, offset), int(4, part.len() as u64)].concat()));
+            let chunk = [bytes(1, &sha), fixed32(2, moved::adler(part)), int(3, offset), int(4, part.len() as u64)];
+            mapping.extend(bytes(6, &chunk.concat()));
             responses.insert(hex(&sha), encrypt(&compressed(part, "zstd")));
             offset += part.len() as u64;
         }
@@ -655,6 +660,171 @@ fn updates_in_place_and_removes_what_the_new_version_dropped() {
     assert_eq!(run(vec![french3]), (0, 2, 0));
     assert_eq!(run(vec![game3]), (0, 6, 0));
     assert_eq!(read("lang/fr.txt"), fr);
+}
+
+/// `size` bytes that look random, different for each `seed`.
+fn noise(seed: u64, size: usize) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 32) as u8
+    };
+    (0..size).map(|_| next()).collect()
+}
+
+#[test]
+fn finds_chunks_at_any_offset_by_their_checksum() {
+    use moved::{Region, WINDOW};
+    use std::sync::atomic::AtomicBool;
+    // Adler-32 from 0: the sum of the bytes, and above it the sum of those sums.
+    assert_eq!(moved::adler(b"abc"), (97 + 195 + 294) << 16 | 294);
+    assert_eq!(moved::adler(&[255; 70_000]), 6313 << 16 | 28_288, "the sums wrap at 65521");
+
+    let temp = TempDir::new("search");
+    let (first, second, absent) = (noise(1, WINDOW), noise(2, WINDOW), noise(3, WINDOW));
+    let files = [temp.0.join("old.bin")];
+    let content = [&noise(4, 700)[..], &first, &noise(5, 12_345), &second, &noise(6, 99)].concat();
+    fs::write(&files[0], &content).unwrap();
+    let key = |data: &[u8]| -> [u8; 20] { Sha1::digest(data).into() };
+    let wanted = [&first, &second, &absent].map(|data| (key(data), moved::adler(data)));
+    let search = |start: u64, wanted: &[([u8; 20], u32)], stop: bool| {
+        let regions = [Region { file: 0, start, end: content.len() as u64 }];
+        moved::search(&files, &regions, wanted, 2, &AtomicBool::new(stop))
+    };
+
+    let second_at = (700 + WINDOW + 12_345) as u64;
+    assert_eq!(search(0, &wanted, false), HashMap::from([(key(&first), (0, 700)), (key(&second), (0, second_at))]));
+    // A chunk that is only partly in the region is not found, nor one whose
+    // checksum is not the manifest's, nor anything once stopped.
+    assert_eq!(search(701, &wanted, false), HashMap::from([(key(&second), (0, second_at))]));
+    assert!(search(0, &[(key(&first), moved::adler(&first) ^ 1)], false).is_empty());
+    assert!(search(0, &wanted, true).is_empty());
+}
+
+#[test]
+fn orders_copies_so_that_none_overwrites_what_another_still_reads() {
+    use moved::{Move, Step};
+    // A file of one-byte chunks, each a letter. Copies what `new` has that
+    // `old` has elsewhere, and returns the file after and how many chunks
+    // were held in memory.
+    let run = |old: &str, new: &str, budget: u64| {
+        let mut disk = old.as_bytes().to_vec();
+        disk.resize(old.len().max(new.len()), b'.');
+        let mut moves: Vec<Move> = Vec::new();
+        for (to, letter) in new.bytes().enumerate() {
+            let Some(from) = old.bytes().position(|other| other == letter).filter(|_| disk[to] != letter) else { continue };
+            match moves.iter_mut().find(|each| each.from.1 == from as u64) {
+                Some(each) => each.to.push((0, to as u64)),
+                None => moves.push(Move { from: (0, from as u64), size: 1, to: vec![(0, to as u64)] }),
+            }
+        }
+        let (mut held, mut holds) = (HashMap::new(), 0);
+        for step in moved::schedule(&moves, budget) {
+            match step {
+                Step::Hold(index) => {
+                    held.insert(index, disk[moves[index].from.1 as usize]);
+                    holds += 1;
+                }
+                Step::Copy(index) => {
+                    let byte = held.remove(&index).unwrap_or(disk[moves[index].from.1 as usize]);
+                    moves[index].to.iter().for_each(|&(_, to)| disk[to as usize] = byte);
+                }
+            }
+        }
+        (String::from_utf8(disk).unwrap(), holds)
+    };
+    // Content pushed up by something new before it, which is downloaded later: the last chunk goes first.
+    assert_eq!(run("abcd", "Xabcd", 9), ("aabcd".into(), 0));
+    // Pulled down: the first goes first.
+    assert_eq!(run("Xabcd", "abcd", 9), ("abcdd".into(), 0));
+    // One chunk wanted in several places, and one already in place.
+    assert_eq!(run("abc", "cbcc", 9), ("cbcc".into(), 0));
+    // Two swapped, and five in a ring: one is held in memory while the others move.
+    assert_eq!(run("ab", "ba", 9), ("ba".into(), 1));
+    assert_eq!(run("abcde", "eabcd", 9), ("eabcd".into(), 1));
+    assert_eq!(run("abcdef", "badcfe", 9), ("badcfe".into(), 3));
+    // The memory is for what is held at one time, and here that is one chunk.
+    assert_eq!(run("abcdef", "badcfe", 1), ("badcfe".into(), 3));
+    // Without the memory for it, one chunk of a ring is left to be downloaded.
+    let (disk, holds) = run("abcde", "eabcd", 0);
+    assert_eq!((disk.bytes().zip("eabcd".bytes()).filter(|(now, new)| now == new).count(), holds), (4, 0));
+}
+
+#[test]
+fn an_update_copies_what_only_moved_instead_of_downloading_it() {
+    use moved::WINDOW;
+    let temp = TempDir::new("moved");
+    let out = &temp.0;
+    let [a, b, c, d, e, f, g, added] = [1, 2, 3, 4, 5, 6, 7, 8].map(|seed| noise(seed, WINDOW));
+    let (start, end, new_end) = (noise(9, 1000), noise(10, 500), noise(11, 600));
+    type Files<'a> = Vec<(&'a str, Vec<&'a [u8]>)>;
+    let old: Files = vec![("pushed.pak", vec![&a, &b, &c]), ("swapped.pak", vec![&d, &e]),
+                          ("old-name.pak", vec![&f, &g, &end]), ("same.pak", vec![&a])];
+    // The new version puts 1000 bytes at the start of one file, which pushes
+    // its content up; swaps the two chunks of another; renames a third, with
+    // a new end; and has two chunks a second time, in a new file: one that
+    // the old version has and one that it does not.
+    let new: Files = vec![("pushed.pak", vec![&start, &a, &b, &c, &added]), ("swapped.pak", vec![&e, &d]),
+                          ("new-name.pak", vec![&f, &g, &new_end]), ("same.pak", vec![&a]),
+                          ("twice.pak", vec![&b, &added])];
+    let mut responses = HashMap::new();
+    let files: Vec<(&str, &[&[u8]])> = new.iter().map(|(name, parts)| (*name, &parts[..])).collect();
+    let package = depot::Package { depots: vec![depot_of(123, &files, &mut responses)], ..Default::default() };
+    // The server has only what the old version does not.
+    let fresh = [&start, &added, &new_end].map(|part| hex(&Sha1::digest(part)));
+    responses.retain(|sha, _| fresh.contains(sha));
+    let server = serve(&responses, false);
+    let (agent, servers) = (download::agent(2), [server.url.clone()]);
+
+    // Once as the window does it, with a check before the download, and once without.
+    let mut last = None;
+    for checked in [true, false] {
+        // The old version, as an earlier download left it, and a file of the player's.
+        _ = fs::remove_dir_all(out);
+        fs::create_dir_all(out).unwrap();
+        for (name, parts) in &old {
+            fs::write(out.join(name), parts.concat()).unwrap();
+        }
+        let names = old.iter().map(|(name, _)| name.to_string()).collect();
+        installed::Installed { depots: [(123, names)].into() }.save(out).unwrap();
+        fs::write(out.join("save.dat"), "mine").unwrap();
+
+        // A check finds what is in place and what is elsewhere, and changes nothing.
+        let previous = checked.then(|| {
+            let progress = Progress::default();
+            let on_disk = download::check(&package, out, None, &progress).unwrap().unwrap();
+            assert_eq!((progress.done.load(Relaxed), progress.elsewhere.load(Relaxed)), (1 << 20, 8 << 20));
+            assert_eq!(fs::read(out.join("swapped.pak")).unwrap(), [&d[..], &e].concat());
+            assert!(out.join("old-name.pak").exists() && !out.join("new-name.pak").exists());
+            on_disk
+        });
+
+        // The download copies those eight chunks and fetches the three new
+        // ones, the one that goes to two places only once.
+        let progress = Progress::default();
+        let summary = download::download(&package, out, 2, &agent, &servers, previous.as_ref(), &progress).unwrap();
+        let said = progress.lines(0).join("\n");
+        assert_eq!((summary.fetched, summary.reused, removed(&progress)), (4, 9, 1), "{said}");
+        assert_eq!(progress.fetched.load(Relaxed), (2 << 20) + 1000 + 600);
+        assert!(said.contains("Another 8.0 MiB is in the folder"), "{said}");
+        // Having been checked, the folder is not searched a second time.
+        assert_eq!(said.contains("Looking through"), !checked, "{said}");
+        for (name, parts) in &new {
+            assert!(fs::read(out.join(name)).unwrap() == parts.concat(), "{name}");
+        }
+        assert!(!out.join("old-name.pak").exists());
+        assert_eq!(fs::read(out.join("save.dat")).unwrap(), b"mine");
+        assert_eq!((progress.done.load(Relaxed), progress.elsewhere.load(Relaxed)), (summary.bytes, 0));
+        last = summary.on_disk;
+    }
+    assert_eq!(server.requests.lock().unwrap().len(), 6);
+
+    // Run again, there is nothing to do.
+    let summary = download::download(&package, out, 2, &agent, &servers, last.as_ref(), &Progress::default()).unwrap();
+    assert_eq!((summary.fetched, summary.reused), (0, 13));
+    assert_eq!(server.requests.lock().unwrap().len(), 6);
 }
 
 /// Makes a folder writable again when dropped, so that a test that fails

@@ -1,6 +1,7 @@
 //! The download engine. Every chunk is written straight into its file at its
 //! offset, so resuming needs no state: a run first checks which chunks are
-//! already on disk with the right SHA-1, then fetches the rest.
+//! already on disk with the right SHA-1, then copies into place the chunks
+//! that an older version has somewhere else, then fetches the rest.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -15,6 +16,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use sha1::{Digest, Sha1};
 
 use crate::depot::{self, Chunk, Depot, Entry, Package};
+use crate::moved::{self, Move, Region, Step};
 use crate::{installed, log};
 
 const SERVER_LIST: &str = "https://api.steampowered.com/IContentServerDirectoryService/\
@@ -29,6 +31,8 @@ const RETRY_DELAY: Duration = Duration::from_millis(if cfg!(test) { 10 } else { 
 const STALL: Duration = Duration::from_millis(if cfg!(test) { 1000 } else { 10_000 });
 /// How often a download logs how far it has got.
 const REPORT_EVERY: Duration = Duration::from_secs(15);
+/// The most content kept in memory while chunks that swap places are copied.
+const HOLD: u64 = 256 << 20;
 
 /// Progress shared between the download threads and the display.
 #[derive(Default)]
@@ -42,6 +46,12 @@ pub struct Progress {
     /// Bytes received from the network (chunks are compressed, so this
     /// usually differs from `fetched`).
     pub received: AtomicU64,
+    /// Bytes of content that are on disk but not where they belong, as an
+    /// older version had them elsewhere: these are copied, not downloaded.
+    pub elsewhere: AtomicU64,
+    /// Set while a download looks for such content and copies it into place,
+    /// which uses the disk and not the network.
+    pub local: AtomicBool,
     /// Set to ask the download to stop after the chunks in flight.
     pub stop: AtomicBool,
     log: Mutex<Vec<String>>,
@@ -204,6 +214,11 @@ fn plan<'a>(package: &'a Package, output: &Path) -> Result<(Vec<PathBuf>, Vec<Ta
 #[derive(Debug, Default)]
 pub struct OnDisk {
     files: HashMap<PathBuf, Found>,
+    /// Chunks seen somewhere other than their place: the file and the offset.
+    /// Each is checked again when it is copied, so an entry may be out of date.
+    elsewhere: HashMap<[u8; 20], (PathBuf, u64)>,
+    /// The files already searched for such chunks.
+    searched: HashSet<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -238,7 +253,8 @@ impl OnDisk {
 }
 
 /// Find which chunks of `package` are already in `output` and add their size
-/// to `progress.done`, without writing anything. Files unchanged since
+/// to `progress.done`, and the size of those that are there but out of place
+/// to `progress.elsewhere`, without writing anything. Files unchanged since
 /// `previous` was made are not read again. `None` means `progress.stop` cut
 /// the check short.
 pub fn check(package: &Package, output: &Path, previous: Option<&OnDisk>, progress: &Progress)
@@ -247,12 +263,17 @@ pub fn check(package: &Package, output: &Path, previous: Option<&OnDisk>, progre
     progress.total.store(targets.iter().map(|target| target.entry.size).sum(), Relaxed);
     log::write(format!("check: {output:?}, depots {:?}, {} bytes",
                        package.depots.iter().map(|depot| depot.id).collect::<Vec<_>>(), progress.total.load(Relaxed)));
-    check_files(&targets, previous, progress)
+    let Some(mut on_disk) = check_files(&targets, previous, progress)? else { return Ok(None) };
+    let complete = find_elsewhere(&targets, &installed::leftovers(output, package), &mut on_disk, progress);
+    Ok(complete.then_some(on_disk))
 }
 
 fn check_files(targets: &[Target], previous: Option<&OnDisk>, progress: &Progress) -> Result<Option<OnDisk>> {
     let started = Instant::now();
     let mut on_disk = OnDisk::default();
+    if let Some(previous) = previous {
+        (on_disk.elsewhere, on_disk.searched) = (previous.elsewhere.clone(), previous.searched.clone());
+    }
     let mut queue = Vec::new();
     let (mut present, mut reused) = (0, 0);
     for (t, target) in targets.iter().enumerate() {
@@ -280,6 +301,7 @@ fn check_files(targets: &[Target], previous: Option<&OnDisk>, progress: &Progres
         }
         let present = |c: &usize| chunks[*c].offset + u64::from(chunks[*c].size) <= found.len;
         queue.extend((0..chunks.len()).filter(present).map(|c| (t, c)));
+        on_disk.searched.remove(&target.path); // It changed, so it may hold other content now.
         on_disk.files.insert(target.path.clone(), found);
     }
 
@@ -320,6 +342,168 @@ fn check_files(targets: &[Target], previous: Option<&OnDisk>, progress: &Progres
     Ok(Some(on_disk))
 }
 
+/// Find the chunks that are not in place but are somewhere else on disk: in
+/// what an older version left in the files of `targets`, or in `stale`, the
+/// files of that version which the new one no longer has. Records where in
+/// `on_disk` and their size in `progress.elsewhere`, and writes nothing.
+/// Returns false if `progress.stop` cut it short.
+fn find_elsewhere(targets: &[Target], stale: &[PathBuf], on_disk: &mut OnDisk, progress: &Progress) -> bool {
+    let started = Instant::now();
+    let mut missing: HashMap<[u8; 20], &Chunk> = HashMap::new();
+    for target in targets {
+        for (c, chunk) in target.entry.chunks.iter().enumerate() {
+            if !on_disk.is_good(&target.path, c) {
+                missing.insert(chunk.sha, chunk);
+            }
+        }
+    }
+    on_disk.elsewhere.retain(|sha, _| missing.contains_key(sha));
+    if !missing.is_empty() {
+        // A chunk the package has twice may be in place at one of the two.
+        for target in targets {
+            for (c, chunk) in target.entry.chunks.iter().enumerate() {
+                if missing.contains_key(&chunk.sha) && on_disk.is_good(&target.path, c) {
+                    on_disk.elsewhere.insert(chunk.sha, (target.path.clone(), chunk.offset));
+                }
+            }
+        }
+    }
+    let wanted: Vec<([u8; 20], u32)> = missing.values()
+        .filter(|chunk| chunk.size as usize == moved::WINDOW && !on_disk.elsewhere.contains_key(&chunk.sha))
+        .map(|chunk| (chunk.sha, chunk.sum))
+        .collect();
+
+    // Where an older version's content may be: wherever a file does not hold
+    // the new version's, past the new version's end, and in the stale files.
+    let mut files: Vec<PathBuf> = targets.iter().map(|target| target.path.clone()).collect();
+    let mut regions = Vec::new();
+    let mut add = |file: usize, start: u64, end: u64| {
+        if end.saturating_sub(start) >= moved::WINDOW as u64 {
+            regions.push(Region { file, start, end });
+        }
+    };
+    for (t, target) in targets.iter().enumerate() {
+        let Some(found) = on_disk.files.get(&target.path).filter(|_| !on_disk.searched.contains(&target.path)) else {
+            continue;
+        };
+        let mut run = None; // Where the chunks not in place began.
+        for (chunk, good) in target.entry.chunks.iter().zip(&found.good) {
+            match (*good, run) {
+                (false, None) => run = Some(chunk.offset),
+                (true, Some(start)) => {
+                    add(t, start, chunk.offset.min(found.len));
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+        add(t, run.unwrap_or(target.entry.size), found.len);
+    }
+    for path in stale.iter().filter(|path| !on_disk.searched.contains(*path)) {
+        if let Ok(meta) = fs::metadata(path) {
+            add(files.len(), 0, meta.len());
+            files.push(path.clone());
+        }
+    }
+    let size: u64 = regions.iter().map(|region| region.end - region.start).sum();
+    log::write(format!("search: {} chunks missing, {} of them known elsewhere, {} to look for in {size} bytes of {} files",
+                       missing.len(), on_disk.elsewhere.len(), wanted.len(), regions.len()));
+    if !wanted.is_empty() && !regions.is_empty() {
+        progress.log(format!("Looking through {} that an older version left for content this one still has.", human(size)));
+        let threads = thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+        let places = moved::search(&files, &regions, &wanted, threads, &progress.stop);
+        log::write(format!("search: found {} of {} chunks with {threads} threads in {:.3}s",
+                           places.len(), wanted.len(), started.elapsed().as_secs_f64()));
+        on_disk.elsewhere.extend(places.into_iter().map(|(sha, (file, offset))| (sha, (files[file].clone(), offset))));
+    }
+    if progress.stop.load(Relaxed) {
+        return false;
+    }
+    on_disk.searched.extend(files.into_iter().chain(stale.iter().cloned()));
+    let mut elsewhere = 0;
+    for target in targets {
+        for (c, chunk) in target.entry.chunks.iter().enumerate() {
+            if !on_disk.is_good(&target.path, c) && on_disk.elsewhere.contains_key(&chunk.sha) {
+                elsewhere += u64::from(chunk.size);
+            }
+        }
+    }
+    progress.elsewhere.store(elsewhere, Relaxed);
+    true
+}
+
+/// Copy into place the chunks that `on_disk` has seen elsewhere, checking
+/// each one's SHA-1 first. Returns the (target, chunk) pairs written; a chunk
+/// that is no longer where it was seen is left to be downloaded.
+fn relocate(targets: &[Target], on_disk: &OnDisk, progress: &Progress) -> Result<Vec<(usize, usize)>> {
+    let started = Instant::now();
+    let mut paths: Vec<&Path> = targets.iter().map(|target| target.path.as_path()).collect();
+    let mut files: HashMap<&Path, usize> = paths.iter().enumerate().map(|(t, path)| (*path, t)).collect();
+    // One move for each chunk, however many places it goes to.
+    let mut by_sha: HashMap<[u8; 20], usize> = HashMap::new();
+    let (mut moves, mut places): (Vec<Move>, Vec<Vec<(usize, usize)>>) = (Vec::new(), Vec::new());
+    for (t, target) in targets.iter().enumerate() {
+        for (c, chunk) in target.entry.chunks.iter().enumerate() {
+            let Some((path, offset)) = on_disk.elsewhere.get(&chunk.sha).filter(|_| !on_disk.is_good(&target.path, c)) else {
+                continue;
+            };
+            let index = *by_sha.entry(chunk.sha).or_insert_with(|| {
+                let file = *files.entry(path.as_path()).or_insert_with(|| {
+                    paths.push(path);
+                    paths.len() - 1
+                });
+                moves.push(Move { from: (file, *offset), size: chunk.size, to: Vec::new() });
+                places.push(Vec::new());
+                moves.len() - 1
+            });
+            moves[index].to.push((t, chunk.offset));
+            places[index].push((t, c));
+        }
+    }
+    let steps = moved::schedule(&moves, HOLD);
+    log::write(format!("move: {} chunks to copy, {} of them held in memory first, {} given up", moves.len(),
+                       steps.iter().filter(|step| matches!(step, Step::Hold(_))).count(),
+                       moves.len() - steps.iter().filter(|step| matches!(step, Step::Copy(_))).count()));
+    let read = |index: usize| {
+        let (from, chunk) = (moves[index].from, &targets[places[index][0].0].entry.chunks[places[index][0].1]);
+        let mut data = vec![0; chunk.size as usize];
+        let result = File::open(paths[from.0]).and_then(|file| read_at(&file, &mut data, from.1));
+        if result.is_ok() && Sha1::digest(&data)[..] == chunk.sha {
+            return Some(data);
+        }
+        log::write(format!("move: {:?} at {} no longer holds the chunk seen there ({result:?}); it will be downloaded",
+                           paths[from.0], from.1));
+        None
+    };
+    let (mut held, mut written) = (HashMap::new(), Vec::new());
+    let mut open: Option<(usize, File)> = None;
+    for step in steps {
+        if progress.stop.load(Relaxed) {
+            break;
+        }
+        let (Step::Hold(index) | Step::Copy(index)) = step;
+        let Some(data) = held.remove(&index).or_else(|| read(index)) else { continue };
+        if matches!(step, Step::Hold(_)) {
+            held.insert(index, data);
+            continue;
+        }
+        for &(t, c) in &places[index] {
+            let path = &targets[t].path;
+            if open.as_ref().is_none_or(|(file, _)| *file != t) {
+                let file = OpenOptions::new().write(true).create(true).truncate(false).open(path);
+                open = Some((t, file.with_context(|| format!("could not write {}", path.display()))?));
+            }
+            write_at(&open.as_ref().unwrap().1, &data, targets[t].entry.chunks[c].offset)
+                .with_context(|| format!("could not write {}", path.display()))?;
+            progress.done.fetch_add(data.len() as u64, Relaxed);
+            progress.elsewhere.fetch_sub(data.len() as u64, Relaxed);
+            written.push((t, c));
+        }
+    }
+    log::write(format!("move: {} chunks written in {:.3}s", written.len(), started.elapsed().as_secs_f64()));
+    Ok(written)
+}
+
 /// The open handle of a file being written, shared by the workers writing it
 /// and closed after its last queued chunk.
 #[derive(Default)]
@@ -349,8 +533,11 @@ impl Slot {
 struct Work<'a> {
     targets: &'a [Target<'a>],
     slots: Vec<Slot>,
-    /// (target, chunk) pairs still to fetch, in file and offset order.
+    /// (target, chunk) pairs still to fetch, in file and offset order. A
+    /// chunk the package has in several places is here once.
     queue: Vec<(usize, usize)>,
+    /// The other places of such a chunk, by its SHA-1.
+    twins: HashMap<[u8; 20], Vec<(usize, usize)>>,
     next: AtomicUsize,
     failed: AtomicUsize,
     fatal: Mutex<Option<anyhow::Error>>,
@@ -374,12 +561,13 @@ pub fn download(package: &Package, output: &Path, jobs: usize, agent: &ureq::Age
     };
     create(output)?;
     progress.log(format!("Output: {}", output.display()));
+    let make_folders = || {
+        let parents = targets.iter().filter_map(|target| target.path.parent());
+        folders.iter().map(PathBuf::as_path).chain(parents).try_for_each(create)
+    };
     // Before the new folders are made: one may be where an old file is.
-    installed::update(output, package, progress)?;
-    let parents = targets.iter().filter_map(|target| target.path.parent());
-    for folder in folders.iter().map(PathBuf::as_path).chain(parents) {
-        create(folder)?;
-    }
+    let (stale, removed) = installed::begin(output, package, progress)?;
+    make_folders()?;
     let mut summary = Summary {
         files: targets.len(),
         bytes: targets.iter().map(|target| target.entry.size).sum(),
@@ -397,19 +585,53 @@ pub fn download(package: &Package, output: &Path, jobs: usize, agent: &ureq::Age
     if found > 0 {
         progress.log(format!("Already downloaded: {} of {}.", human(found), human(summary.bytes)));
     }
-    let queue: Vec<(usize, usize)> = targets.iter().enumerate()
+    // What an older version has elsewhere is copied before anything is
+    // downloaded, as a download may overwrite it.
+    progress.local.store(true, Relaxed);
+    let mut touched = HashSet::new();
+    if find_elsewhere(&targets, &stale, &mut on_disk, progress) {
+        let elsewhere = progress.elsewhere.load(Relaxed);
+        if elsewhere > 0 {
+            progress.log(format!("Another {} is in the folder, but not where this version has it. \
+                                  Copying it into place instead of downloading it.", human(elsewhere)));
+        }
+        for (t, c) in relocate(&targets, &on_disk, progress)? {
+            on_disk.add(&targets[t], c);
+            touched.insert(t);
+        }
+    }
+    if !progress.stop.load(Relaxed) {
+        progress.elsewhere.store(0, Relaxed); // What could not be copied after all is downloaded.
+        // Nothing more is wanted from the files this version no longer has.
+        // Removing the last file of a folder removes the folder too, so make
+        // the new version's folders again.
+        installed::finish(output, package, removed, progress)?;
+        make_folders()?;
+    }
+    progress.local.store(false, Relaxed);
+    let missing: Vec<(usize, usize)> = targets.iter().enumerate()
         .flat_map(|(t, target)| (0..target.entry.chunks.len()).map(move |c| (t, c)))
         .filter(|&(t, c)| !on_disk.is_good(&targets[t].path, c))
         .collect();
-    summary.reused = targets.iter().map(|target| target.entry.chunks.len()).sum::<usize>() - queue.len();
-    let to_fetch: u64 = queue.iter().map(|&(t, c)| u64::from(targets[t].entry.chunks[c].size)).sum();
-    log::write(format!("download: {} chunks to fetch ({to_fetch} bytes), {} already on disk", queue.len(), summary.reused));
+    summary.reused = targets.iter().map(|target| target.entry.chunks.len()).sum::<usize>() - missing.len();
     let mut slots: Vec<Slot> = targets.iter().map(|_| Slot::default()).collect();
-    for &(t, _) in &queue {
+    // A chunk missing in several places is fetched once and written to each.
+    let (mut queue, mut twins, mut queued) = (Vec::new(), HashMap::<_, Vec<_>>::new(), HashSet::new());
+    let mut to_fetch = 0;
+    for &(t, c) in &missing {
+        let chunk = &targets[t].entry.chunks[c];
         *slots[t].remaining.get_mut() += 1;
+        if queued.insert(chunk.sha) {
+            queue.push((t, c));
+            to_fetch += u64::from(chunk.size);
+        } else {
+            twins.entry(chunk.sha).or_default().push((t, c));
+        }
     }
+    log::write(format!("download: {} chunks to fetch ({to_fetch} bytes) for {} places, {} already on disk",
+                       queue.len(), missing.len(), summary.reused));
     let work = Work {
-        targets: &targets, slots, queue, next: AtomicUsize::new(0), failed: AtomicUsize::new(0),
+        targets: &targets, slots, queue, twins, next: AtomicUsize::new(0), failed: AtomicUsize::new(0),
         fatal: Mutex::new(None), reported: Mutex::new(Instant::now()), agent, servers, progress,
     };
     let fetching = Instant::now();
@@ -430,7 +652,6 @@ pub fn download(package: &Package, output: &Path, jobs: usize, agent: &ureq::Age
     let failed = work.failed.into_inner();
     ensure!(failed == 0, "{failed} chunks could not be downloaded; try again to fetch them");
     summary.fetched = written.len();
-    let mut touched = HashSet::new();
     for (t, c) in written {
         on_disk.add(&targets[t], c);
         touched.insert(t);
@@ -489,15 +710,21 @@ impl Work<'_> {
         while !self.progress.stop.load(Relaxed) {
             let Some(&(t, c)) = self.queue.get(self.next.fetch_add(1, Relaxed)) else { break };
             let (target, chunk) = (&self.targets[t], &self.targets[t].entry.chunks[c]);
+            // Every place the chunk goes.
+            let places = || [(t, c)].into_iter().chain(self.twins.get(&chunk.sha).into_iter().flatten().copied());
             match self.fetch(target, chunk, &mut server) {
-                Ok(plain) => match self.slots[t].write(&target.path, &plain, chunk.offset) {
-                    Ok(()) => {
-                        self.progress.done.fetch_add(chunk.size.into(), Relaxed);
-                        self.progress.fetched.fetch_add(chunk.size.into(), Relaxed);
-                        written.push((t, c));
-                    }
-                    Err(error) => {
-                        self.abort(anyhow!(error).context(format!("could not write {}", target.path.display())));
+                Ok(plain) => for (t, c) in places() {
+                    let target = &self.targets[t];
+                    match self.slots[t].write(&target.path, &plain, target.entry.chunks[c].offset) {
+                        Ok(()) => {
+                            self.progress.done.fetch_add(chunk.size.into(), Relaxed);
+                            self.progress.fetched.fetch_add(chunk.size.into(), Relaxed);
+                            written.push((t, c));
+                        }
+                        Err(error) => {
+                            self.abort(anyhow!(error).context(format!("could not write {}", target.path.display())));
+                            break;
+                        }
                     }
                 },
                 Err(_) if self.progress.stop.load(Relaxed) => {}
@@ -509,7 +736,7 @@ impl Work<'_> {
                     }
                 }
             }
-            self.slots[t].finish_chunk();
+            places().for_each(|(t, _)| self.slots[t].finish_chunk());
             self.report();
         }
         written
@@ -605,7 +832,7 @@ fn set_mode(_: &File, _: &Entry) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+pub fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<()> {
     std::os::unix::fs::FileExt::read_exact_at(file, buffer, offset)
 }
 
@@ -615,7 +842,7 @@ fn write_at(file: &File, data: &[u8], offset: u64) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn read_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
+pub fn read_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buffer.is_empty() {
         match file.seek_read(buffer, offset)? {

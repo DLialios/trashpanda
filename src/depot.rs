@@ -23,6 +23,8 @@ pub type Key = [u8; 32];
 #[derive(Clone)]
 pub struct Chunk {
     pub sha: [u8; 20],
+    /// Steam's checksum of the content, see `moved::adler`; 0 if the manifest has none.
+    pub sum: u32,
     pub offset: u64,
     pub size: u32,
 }
@@ -325,6 +327,7 @@ pub fn parse_manifest(data: &[u8], keys: &HashMap<u32, Key>, warnings: &mut Vec<
                 let chunk = protobuf(chunk.bytes())?;
                 entry.chunks.push(Chunk {
                     sha: field(&chunk, 1).map_or(&[][..], Value::bytes).try_into().unwrap_or_default(),
+                    sum: field(&chunk, 2).map_or(0, Value::int) as u32,
                     offset: field(&chunk, 3).map_or(0, Value::int),
                     size: field(&chunk, 4).map_or(0, Value::int).try_into().unwrap_or(0),
                 });

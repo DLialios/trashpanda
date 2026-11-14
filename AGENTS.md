@@ -33,6 +33,23 @@ One fetched from the CDN arrives ZIP-wrapped and normally has its file names
 encrypted with the depot key. The chunk list is sorted by SHA-1 rather than
 offset, so chunks must be written at their `offset` or the file hash fails.
 
+Each chunk entry also has a checksum (`crc`, a fixed32): Adler-32 of the
+chunk's content, but started from 0 rather than the standard 1. Adler-32 can be
+moved along a file one byte at a time, so it finds a chunk at any offset.
+
+### Updates reuse chunks
+
+Content that a new version only moved keeps its chunk: the new manifest lists
+the same SHA-1 at another offset, or in another file. Inserting data near the
+start of a `.pak` moves everything after it, and renaming a file moves all of
+it. The Steam client copies such chunks from the old files instead of
+downloading them. A chunk counts as present only if it is at its offset in its
+file, so comparing in place alone overstates an update: Bodycam's update from
+September to November 2026 was 69.6 GiB in all, with 22.2 GiB still in place,
+29.0 GiB on disk at other offsets or in other files, and 18.4 GiB new. Nearly
+all chunks are exactly 1 MiB; only the last of a file, or one beside a change,
+is smaller.
+
 ## What a download needs
 
 Strictly, two things: the **depot key** and the **manifest file**. Everything
