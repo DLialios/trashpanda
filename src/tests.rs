@@ -1308,6 +1308,46 @@ fn window_icon_is_a_square_png() {
 }
 
 #[test]
+fn banner_mark_is_three_times_the_size_it_is_drawn_at() {
+    // 36 by 30 points on the banner.
+    assert_eq!(crate::gui::mark().size, [108, 90]);
+}
+
+#[test]
+fn the_banner_runs_from_navy_to_a_bright_blue() {
+    use crate::gui::blue_at;
+    use eframe::egui::Color32;
+    assert_eq!(blue_at(0.0), Color32::from_rgb(0x0b, 0x18, 0x30));
+    assert_eq!(blue_at(0.68), Color32::from_rgb(0x14, 0x4b, 0x7e));
+    assert_eq!(blue_at(1.0), Color32::from_rgb(0x13, 0x87, 0xb8));
+    // Between two of its colours it is between them, and past its ends it stays.
+    assert_eq!(blue_at(0.84), Color32::from_rgb(0x14, 0x69, 0x9b));
+    assert_eq!((blue_at(-1.0), blue_at(2.0)), (blue_at(0.0), blue_at(1.0)));
+}
+
+#[test]
+fn a_press_resizes_the_window_only_near_its_edges() {
+    use crate::gui::edge_at;
+    use eframe::egui::{self, ResizeDirection::*};
+    let room = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 700.0));
+    let at = |x: f32, y: f32| edge_at(room, egui::pos2(x, y));
+    // The middle of each edge resizes one way.
+    assert_eq!(at(500.0, 2.0), Some(North));
+    assert_eq!(at(500.0, 698.0), Some(South));
+    assert_eq!(at(2.0, 350.0), Some(West));
+    assert_eq!(at(998.0, 350.0), Some(East));
+    // A corner resizes both ways, from further along the edge than the edge is deep.
+    assert_eq!(at(2.0, 2.0), Some(NorthWest));
+    assert_eq!(at(990.0, 2.0), Some(NorthEast));
+    assert_eq!(at(2.0, 690.0), Some(SouthWest));
+    assert_eq!(at(998.0, 690.0), Some(SouthEast));
+    // The rest of the window does not, the banner and its buttons included.
+    assert_eq!(at(500.0, 26.0), None);
+    assert_eq!(at(975.0, 26.0), None);
+    assert_eq!(at(990.0, 690.0), None);
+}
+
+#[test]
 fn guesses_what_a_depot_is_for_from_its_file_names() {
     use crate::glimpse::{self, Platform};
     let systems = |files: &[&str]| {

@@ -19,6 +19,38 @@ use crate::select::{self, Choices, Offer, Selector, Tags};
 use crate::update::{self, Release, Unwritable, Updater, Version};
 
 const TITLE: &str = "Trash Panda";
+/// The height of the banner across the top, which is the window's title bar.
+const BANNER: f32 = 52.0;
+/// The banner's colours from left to right, and how far across each one is:
+/// the blues of the icon's disc.
+const BANNER_STOPS: [(f32, egui::Color32); 4] = [
+    (0.0, egui::Color32::from_rgb(0x0b, 0x18, 0x30)),
+    (0.28, egui::Color32::from_rgb(0x0d, 0x25, 0x50)),
+    (0.68, egui::Color32::from_rgb(0x14, 0x4b, 0x7e)),
+    (1.0, egui::Color32::from_rgb(0x13, 0x87, 0xb8)),
+];
+/// How far across the banner the accent colour is taken from: the blue of
+/// the large buttons and of what is chosen.
+const ACCENT_AT: f32 = 0.84;
+/// The size of the raccoon's head on the banner.
+const MARK: egui::Vec2 = egui::vec2(36.0, 30.0);
+/// The width of the buttons that minimise, maximise and close the window,
+/// which is what Windows gives its own.
+const WINDOW_BUTTON: f32 = 46.0;
+/// How near an edge of the window a press resizes it, and how near a corner
+/// along that edge it resizes both ways.
+const EDGE: f32 = 5.0;
+const CORNER: f32 = 14.0;
+/// The size of the large button at the foot of the window, unless its words
+/// need it wider, and of the square one beside it.
+const BIG_BUTTON: egui::Vec2 = egui::vec2(140.0, 40.0);
+const ICON_BUTTON: f32 = 40.0;
+/// The width of the small lines beside the big number at the foot.
+const NOTE: f32 = 260.0;
+/// The space between the time left and the buttons after it.
+const TIME_GAP: f32 = 20.0;
+/// The colour of news: the dot on a release to install.
+const NEWS: egui::Color32 = egui::Color32::from_rgb(0xff, 0x8f, 0x00);
 /// How far inside the main window's edges the log and the depots open.
 const MODAL_MARGIN: f32 = 48.0;
 /// The width of the path fields' labels.
@@ -35,18 +67,25 @@ const LIST_ROWS: f32 = 10.0;
 
 pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
+        // The system draws no frame: the banner is the title bar (see
+        // `App::banner`), and `resize_edges` stands in for the borders.
         viewport: egui::ViewportBuilder::default()
             .with_title(TITLE)
             .with_icon(icon())
+            .with_decorations(false)
             .with_inner_size([1000.0, 700.0])
+            .with_min_inner_size([640.0, 420.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native(TITLE, options, Box::new(|creation| {
         creation.egui_ctx.set_theme(egui::Theme::Dark);
+        creation.egui_ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.visuals.selection.bg_fill = blue_at(ACCENT_AT);
+        });
         set_fonts(&creation.egui_ctx);
         let mut app = App::default();
-        app.check_for_update(true);
+        app.check_for_update();
         Ok(Box::new(app))
     }))
 }
@@ -82,6 +121,27 @@ pub fn icon() -> egui::IconData {
         .expect("assets/icon.png is a PNG")
 }
 
+/// The raccoon's head for the banner, drawn three times the size it is
+/// shown at, so that it stays sharp on a dense screen.
+pub fn mark() -> egui::ColorImage {
+    let png = eframe::icon_data::from_png_bytes(include_bytes!("../assets/mark.png")).expect("assets/mark.png is a PNG");
+    egui::ColorImage::from_rgba_unmultiplied([png.width as usize, png.height as usize], &png.rgba)
+}
+
+/// The banner's colour `across` it, from 0 at its left to 1 at its right.
+pub fn blue_at(across: f32) -> egui::Color32 {
+    let next = BANNER_STOPS.iter().position(|&(at, _)| at >= across).unwrap_or(BANNER_STOPS.len() - 1).max(1);
+    let ((from, before), (to, after)) = (BANNER_STOPS[next - 1], BANNER_STOPS[next]);
+    before.lerp_to_gamma(after, ((across - from) / (to - from)).clamp(0.0, 1.0))
+}
+
+/// The banner's blues from left to right, one pixel high: what the banner
+/// is filled with.
+fn blues() -> egui::ColorImage {
+    let width = 256;
+    egui::ColorImage::new([width, 1], (0..width).map(|x| blue_at(x as f32 / (width - 1) as f32)).collect())
+}
+
 /// What is chosen: the package path and output folder as typed, and the
 /// depots left out.
 #[derive(Clone, Default, PartialEq)]
@@ -101,7 +161,7 @@ pub struct App {
     picker: Picker,
     /// Where Steam's records of apps come from.
     mirror: String,
-    /// The choice whose state the progress bar shows.
+    /// The choice whose state the readout shows.
     shown: Choice,
     /// What is on disk for a choice, from the last check or download of it.
     on_disk: Option<(Choice, Arc<OnDisk>)>,
@@ -115,18 +175,21 @@ pub struct App {
     picking: Option<(Pick, JoinHandle<Option<PathBuf>>)>,
     /// Whether the log window is open.
     log_open: bool,
+    /// The raccoon's head on the banner, once it has been drawn.
+    mark: Option<egui::TextureHandle>,
+    /// The banner's blues, once it has been filled with them.
+    blues: Option<egui::TextureHandle>,
     /// What last went wrong with a check, a download or saving the log, in
     /// a few words; the log has the details.
     error: Option<String>,
 }
 
-/// Checking for a newer version, and installing it.
+/// Checking for a newer version, and installing it. The check is made once,
+/// when the window opens, and shows only a newer version.
 enum Update {
-    /// Not checked yet, or a quiet check found nothing worth showing.
+    /// Not checked yet, or the check found nothing newer, or failed.
     Idle,
-    /// A quiet check, made when the window opens, shows only a newer version.
-    Checking { quiet: bool, job: JoinHandle<anyhow::Result<Option<Release>>> },
-    Current,
+    Checking(JoinHandle<anyhow::Result<Option<Release>>>),
     Available(Release),
     Installing { version: Version, job: JoinHandle<anyhow::Result<PathBuf>> },
     /// The new version is installed and started; this window is closing.
@@ -168,6 +231,8 @@ impl Default for App {
             update: Update::Idle,
             picking: None,
             log_open: false,
+            mark: None,
+            blues: None,
             error: None,
         }
     }
@@ -296,7 +361,7 @@ impl App {
                 Err(_) => {
                     log::write(format!("gui: {kind} crashed"));
                     self.error = Some(format!("The {kind} crashed. This is a bug: please send the log \
-                                               (the log button at the top right, then Export log…)."));
+                                               (the log button at the bottom right, then Export log…)."));
                 }
             }
         }
@@ -344,9 +409,9 @@ impl App {
         }
     }
 
-    fn check_for_update(&mut self, quiet: bool) {
-        log::write(format!("gui: checking for updates{}", if quiet { " quietly" } else { "" }));
-        self.update = Update::Checking { quiet, job: thread::spawn(|| Updater::new().check()) };
+    fn check_for_update(&mut self) {
+        log::write("gui: checking for updates");
+        self.update = Update::Checking(thread::spawn(|| Updater::new().check()));
     }
 
     fn install_update(&mut self, release: Release) {
@@ -360,17 +425,17 @@ impl App {
     fn collect_update(&mut self, ctx: &egui::Context) {
         let failed = |message: String| Update::Failed { message, page: None };
         self.update = match std::mem::replace(&mut self.update, Update::Idle) {
-            Update::Checking { quiet, job } if job.is_finished() => match job.join() {
+            // Nobody asked for the check, so only the log hears that it failed.
+            Update::Checking(job) if job.is_finished() => match job.join() {
                 Ok(Ok(Some(release))) => Update::Available(release),
-                Ok(Ok(None)) if !quiet => Update::Current,
                 Ok(Ok(None)) => Update::Idle,
                 Ok(Err(error)) => {
                     log::write(format!("gui: update check failed: {error:#}"));
-                    if quiet { Update::Idle } else { failed(log::brief(&error)) }
+                    Update::Idle
                 }
                 Err(_) => {
                     log::write("gui: the update check crashed");
-                    if quiet { Update::Idle } else { failed("The update check crashed.".into()) }
+                    Update::Idle
                 }
             },
             Update::Installing { version, job } if job.is_finished() => match job.join() {
@@ -405,88 +470,151 @@ impl App {
         };
     }
 
-    /// The update button and, to its left, what it found, laid out right to
-    /// left. Pressing it checks for a newer version, or installs one found.
-    fn update_controls(&mut self, ui: &mut egui::Ui, downloading: bool) {
-        let pressed = match &self.update {
+    /// The banner across the top, which is the window's title bar too: the
+    /// raccoon, the name and the version, news of a release, and the buttons
+    /// that minimise, maximise and close the window. Dragging it moves the
+    /// window, and a double click maximises it or puts it back.
+    fn banner(&mut self, ui: &mut egui::Ui, downloading: bool) {
+        let ctx = ui.ctx().clone();
+        let maximized = ui.input(|input| input.viewport().maximized.unwrap_or(false));
+        // Before what is on it, so that the buttons on it take their own presses.
+        let (rect, bar) = ui.allocate_exact_size(egui::vec2(ui.available_width(), BANNER), egui::Sense::click_and_drag());
+        if bar.double_clicked() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        } else if bar.drag_started_by(egui::PointerButton::Primary) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        let blues = self.blues.get_or_insert_with(|| ctx.load_texture("blues", blues(), egui::TextureOptions::LINEAR)).id();
+        let mark = self.mark.get_or_insert_with(|| {
+            // It is drawn smaller than it is, which only a mipmap does smoothly.
+            let options = egui::TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..egui::TextureOptions::LINEAR };
+            ctx.load_texture("mark", mark(), options)
+        });
+        let painter = ui.painter();
+        let (white, middle) = (egui::Color32::WHITE, rect.center().y);
+        let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        painter.image(blues, rect, whole, white);
+        let mark_rect = egui::Rect::from_min_size(egui::pos2(rect.left() + 15.0, middle - MARK.y / 2.0), MARK);
+        painter.image(mark.id(), mark_rect, whole, white);
+        let title = painter.layout_no_wrap(TITLE.into(), egui::FontId::new(25.0, egui::FontFamily::Name(BOLD.into())), white);
+        let version = concat!("v", env!("CARGO_PKG_VERSION")).to_string();
+        let version = painter.layout_no_wrap(version, egui::FontId::proportional(13.0), white.gamma_multiply(0.6));
+        // The version stands on the line the name is written on.
+        let title_at = egui::pos2(mark_rect.right() + 9.0, middle - title.size().y / 2.0);
+        let version_at = egui::pos2(title_at.x + title.size().x + 9.0, title_at.y + ascent(&title) - ascent(&version));
+        let buttons = rect.right() - 3.0 * WINDOW_BUTTON;
+        let news = egui::Rect::from_min_max(egui::pos2(version_at.x + version.size().x + 12.0, rect.top()),
+                                            egui::pos2(buttons - 8.0, rect.bottom()));
+        painter.galley(title_at, title, white);
+        painter.galley(version_at, version, white);
+        let across = |rect: egui::Rect, layout: egui::Layout| egui::UiBuilder::new().max_rect(rect).layout(layout);
+        ui.scope_builder(across(news, egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+            ui.set_clip_rect(news.intersect(ui.clip_rect()));
+            self.release_news(ui, downloading);
+        });
+        let buttons = egui::Rect::from_min_max(egui::pos2(buttons, rect.top()), rect.max);
+        ui.scope_builder(across(buttons, egui::Layout::right_to_left(egui::Align::Center)), |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            if ui.add(window_button(Icon::Close)).clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            if ui.add(window_button(if maximized { Icon::Restore } else { Icon::Maximize })).clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+            if ui.add(window_button(Icon::Minimize)).clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+        });
+    }
+
+    /// On the banner, beside the version: a newer version, in a pill that
+    /// installs it when pressed, and then says how that is going.
+    fn release_news(&mut self, ui: &mut egui::Ui, downloading: bool) {
+        match &self.update {
             Update::Available(release) => {
-                // Why it cannot be installed now: in a few words, and in full.
+                // Why it cannot be installed now.
                 let blocked = if !update::REPLACES_ITSELF {
-                    Some(("Debug build", "A debug build is never replaced by an update"))
+                    Some("A debug build is never replaced by an update")
                 } else if downloading {
-                    Some(("Pause to update", "Pause the download first; Resume continues it afterwards"))
+                    Some("Pause the download first; Resume continues it afterwards")
                 } else {
                     None
                 };
-                let button = ui.add_enabled(blocked.is_none(), icon_button(Icon::Update, true));
-                let pressed = button.on_hover_text(format!("Install version {}", release.version))
-                    .on_disabled_hover_text(blocked.map_or("", |(_, why)| why)).clicked();
-                if let Some((label, _)) = blocked {
-                    ui.weak(label);
-                }
-                ui.hyperlink_to(format!("Version {} is out", release.version), &release.page)
-                    .on_hover_text("What is new in it");
-                pressed
-            }
-            state => {
-                let words = match state {
-                    Update::Checking { quiet: false, .. } => Some("Checking for updates…".to_string()),
-                    Update::Current => Some("Up to date".into()),
-                    Update::Installing { version, .. } => Some(format!("Updating to {version}…")),
-                    Update::Restarting => Some("Restarting…".into()),
-                    _ => None,
-                };
-                // Words mean it is busy, or has said what it found.
-                let busy = words.is_some() && !matches!(state, Update::Current);
-                let pressed = ui.add_enabled(!busy, icon_button(Icon::Update, false)).on_hover_text("Check for updates").clicked();
-                if let Some(words) = words {
-                    ui.label(words);
-                }
-                pressed
-            }
-        };
-        if pressed {
-            match &mut self.update {
-                Update::Available(release) => {
+                let pill = ui.add_enabled(blocked.is_none(), release_pill(format!("Update to {}", release.version)));
+                let pressed = pill.on_hover_text(format!("Install version {}", release.version))
+                    .on_disabled_hover_text(blocked.unwrap_or_default()).clicked();
+                if pressed {
                     let release = release.clone();
                     self.install_update(release);
                 }
-                Update::Checking { quiet, .. } => *quiet = false, // Show the quiet check instead.
-                _ => self.check_for_update(false),
             }
+            // The pill stays while it does, with nothing left to press.
+            Update::Installing { version, .. } => {
+                ui.add_enabled(false, release_pill(format!("Updating to {version}…")));
+            }
+            Update::Restarting => {
+                ui.add_enabled(false, release_pill("Restarting…".into()));
+            }
+            Update::Idle | Update::Checking(_) | Update::Failed { .. } => {}
+        }
+    }
+
+    /// The button that shows or hides the log.
+    fn log_button(&mut self, ui: &mut egui::Ui) {
+        let hint = if self.log_open { "Hide the log" } else { "Show the log" };
+        if ui.add(icon_button(Icon::Log)).on_hover_text(hint).clicked() {
+            self.log_open = !self.log_open;
         }
     }
 
     /// The progress in big type with the Pause button, or before a download,
     /// how much there is to download with the Download, Resume or Patch button.
+    /// The log's button is beside either, and both are one row of the same
+    /// height, so that the foot of the window stays where it is.
     fn readout(&mut self, ui: &mut egui::Ui, downloading: bool, checking: bool, updating: bool) {
         let (done, total) = (self.progress.done.load(Relaxed), self.progress.total.load(Relaxed));
-        let fraction = self.progress.fraction();
-        let percent = format!("{:.1}%", fraction * 100.0);
+        let percent = format!("{:.1}%", self.progress.fraction() * 100.0);
         let big = |text: String| bold(text, 64.0);
-        let bar = |ui: &mut egui::Ui| ui.add(egui::ProgressBar::new(fraction).desired_height(14.0).corner_radius(7.0));
+        // Beside the foot of the number, from the bottom up: the space is
+        // about what the big digits leave under their baseline.
+        let foot = egui::Layout::bottom_up(egui::Align::Min);
         if downloading {
             let rates = self.meter.update(&self.progress, Instant::now());
-            row(ui, egui::Align::Max, |ui| {
-                ui.label(big(percent));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
-                    ui.label(egui::RichText::new("left").size(22.0).weak());
-                    ui.label(bold(rates.left_text(), 40.0));
-                });
-            });
-            ui.add_space(6.0);
-            bar(ui);
-            ui.add_space(8.0);
+            // Before it downloads, it copies what an older version has in other places.
+            let copying = self.progress.local.load(Relaxed);
             row(ui, egui::Align::Center, |ui| {
-                let (done, total) = (download::human(done), download::human(total));
-                // Before it downloads, it copies what an older version has in other places.
-                let pace = if self.progress.local.load(Relaxed) { "using what is already here".into() } else { rates.speed_text() };
-                ui.label(egui::RichText::new(format!("{done} of {total}   ·   {pace}")).size(16.0).weak());
+                let number = ui.label(big(percent)).rect;
+                // The time left is in large type before the buttons, if all of it fits there.
+                let large = ui.painter().layout_no_wrap(rates.left_text(), egui::FontId::new(40.0, egui::FontFamily::Name(BOLD.into())),
+                                                        ui.visuals().strong_text_color());
+                let word = ui.painter().layout_no_wrap("left".into(), egui::FontId::proportional(22.0), ui.visuals().weak_text_color());
+                let time = egui::vec2(large.size().x + 8.0 + word.size().x, large.size().y);
+                let others = NOTE + TIME_GAP + ICON_BUTTON + BIG_BUTTON.x + 3.0 * ui.spacing().item_spacing.x;
+                let roomy = ui.available_width() >= others + time.x;
+                let pace = match (copying, roomy) {
+                    (true, _) => "using what is already here".into(),
+                    (false, true) => rates.speed_text(),
+                    (false, false) => format!("{}   ·   {} left", rates.speed_text(), rates.left_text()),
+                };
+                ui.allocate_ui_with_layout(egui::vec2(NOTE, number.height()), foot, |ui| {
+                    ui.add_space(12.0);
+                    let amount = format!("{} of {}", download::human(done), download::human(total));
+                    ui.label(egui::RichText::new(format!("{amount}\n{pace}")).size(16.0).weak());
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let pausing = self.progress.stop.load(Relaxed);
-                    if big_button(ui, if pausing { "Pausing…" } else { "Pause" }, false, !pausing).clicked() {
+                    if big_button(ui, if pausing { "Pausing…" } else { "Pause" }, !pausing).clicked() {
                         log::write("gui: pause");
                         self.progress.stop.store(true, Relaxed);
+                    }
+                    self.log_button(ui);
+                    if roomy {
+                        // Level with the buttons, and "left" on the line the figures stand on.
+                        ui.add_space(TIME_GAP);
+                        let (rect, _) = ui.allocate_exact_size(time, egui::Sense::hover());
+                        let word_at = rect.left_top() + egui::vec2(large.size().x + 8.0, ascent(&large) - ascent(&word));
+                        ui.painter().galley(rect.left_top(), large, egui::Color32::PLACEHOLDER);
+                        ui.painter().galley(word_at, word, egui::Color32::PLACEHOLDER);
                     }
                 });
             });
@@ -510,10 +638,7 @@ impl App {
         row(ui, egui::Align::Center, |ui| {
             let number = ui.label(big(amount)).rect;
             let note = if checking { "checking what is\nalready downloaded…".into() } else { note };
-            // Beside the foot of the number, from the bottom up: the space is
-            // about what the big digits leave under their baseline.
-            let foot = egui::Layout::bottom_up(egui::Align::Min);
-            ui.allocate_ui_with_layout(egui::vec2(260.0, number.height()), foot, |ui| {
+            ui.allocate_ui_with_layout(egui::vec2(NOTE, number.height()), foot, |ui| {
                 ui.add_space(12.0);
                 if let Some(package) = &package {
                     let chosen = package.depots.iter().filter(|depot| !self.skip.contains(&depot.id)).count();
@@ -527,15 +652,12 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let label = Next::of(checking, self.progress.update.load(Relaxed), done, total).label();
                 let ready = !checking && !updating && size.is_some() && !no_output;
-                if big_button(ui, label, true, ready).clicked() {
+                if big_button(ui, label, ready).clicked() {
                     self.start();
                 }
+                self.log_button(ui);
             });
         });
-        if started {
-            ui.add_space(6.0);
-            bar(ui);
-        }
     }
 
     /// The session log in a window of its own, with a button to save it.
@@ -628,19 +750,10 @@ impl eframe::App for App {
             }
             ui.add_space(6.0);
         });
+        egui::Panel::top("banner").frame(egui::Frame::NONE).exact_size(BANNER).show_separator_line(false)
+            .show(ui, |ui| self.banner(ui, downloading));
         egui::CentralPanel::default().show(ui, |ui| {
-            row(ui, egui::Align::Max, |ui| {
-                ui.label(bold(TITLE, 30.0).italics());
-                ui.label(egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).weak());
-                // From the right: the log, then updates, whose words have the bar to grow into.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let log = if self.log_open { "Hide the log" } else { "Show the log" };
-                    if ui.add(icon_button(Icon::Log, false)).on_hover_text(log).clicked() {
-                        self.log_open = !self.log_open;
-                    }
-                    self.update_controls(ui, downloading);
-                });
-            });
+            ui.add_space(6.0);
             if let Update::Failed { message, page } = &self.update {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(ui.visuals().error_fg_color, message);
@@ -649,7 +762,6 @@ impl eframe::App for App {
                     }
                 });
             }
-            ui.separator();
             let mut pick = None;
             ui.add_enabled_ui(!downloading, |ui| {
                 let browse = self.picking.is_none();
@@ -678,9 +790,10 @@ impl eframe::App for App {
         self.show_log(ui.ctx());
         self.show_depots(ui.ctx(), !downloading);
         let looking = self.picker.lookup.is_some();
-        if self.task.is_some() || looking || matches!(self.update, Update::Checking { .. } | Update::Installing { .. }) {
+        if self.task.is_some() || looking || matches!(self.update, Update::Checking(_) | Update::Installing { .. }) {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
+        resize_edges(ui.ctx()); // Last, so that the pointer it shows over an edge stays.
     }
 }
 
@@ -705,19 +818,20 @@ fn welcome(ui: &mut egui::Ui) {
     });
 }
 
+/// How far under its top the line that `text` is written on lies.
+fn ascent(text: &egui::Galley) -> f32 {
+    text.rows.first().and_then(|row| row.row.glyphs.first()).map_or(0.0, |glyph| glyph.font_ascent)
+}
+
 /// A row as wide as `ui`, its items lined up across it by `align`.
 fn row<R>(ui: &mut egui::Ui, align: egui::Align, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 0.0), egui::Layout::left_to_right(align), add).inner
 }
 
-/// A large button, filled with the accent colour if it is the `main` one.
-fn big_button(ui: &mut egui::Ui, text: &str, main: bool, enabled: bool) -> egui::Response {
-    let button = if main {
-        egui::Button::new(bold(text, 17.0).color(egui::Color32::WHITE)).fill(ui.visuals().selection.bg_fill)
-    } else {
-        egui::Button::new(egui::RichText::new(text).size(17.0))
-    };
-    ui.add_enabled(enabled, button.min_size(egui::vec2(140.0, 40.0)).corner_radius(8.0))
+/// A large button in the accent colour: the one thing to press next.
+fn big_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+    let button = egui::Button::new(bold(text, 17.0).color(egui::Color32::WHITE)).fill(ui.visuals().selection.bg_fill);
+    ui.add_enabled(enabled, button.min_size(BIG_BUTTON).corner_radius(8.0))
 }
 
 /// A labelled text field filling the row, with a Browse button, which can be
@@ -1184,68 +1298,174 @@ fn list_row(mark: Mark, on: bool, name: &str, size: Option<String>) -> impl egui
     }
 }
 
-/// The drawings on the top bar's buttons.
+/// The drawings on the buttons that have no words.
 #[derive(Clone, Copy)]
 enum Icon {
-    /// Two arrows going round.
-    Update,
     /// A terminal's prompt.
     Log,
+    Minimize,
+    Maximize,
+    /// Two windows, one behind the other: back to the size before.
+    Restore,
+    Close,
 }
 
-/// A small button with an icon drawn on it; `lit` fills it with the accent
-/// colour and adds an orange dot, for news.
-fn icon_button(icon: Icon, lit: bool) -> impl egui::Widget {
-    move |ui: &mut egui::Ui| {
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 26.0), egui::Sense::click());
-        let name = match icon {
-            Icon::Update => "Updates",
+impl Icon {
+    /// What the button is for, for a screen reader and for a pointer resting on it.
+    fn name(self) -> &'static str {
+        match self {
             Icon::Log => "Log",
-        };
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), name));
+            Icon::Minimize => "Minimize",
+            Icon::Maximize => "Maximize",
+            Icon::Restore => "Restore",
+            Icon::Close => "Close",
+        }
+    }
+}
+
+/// A square button with an icon drawn on it, as tall as the big button it
+/// is beside and as round at the corners.
+fn icon_button(icon: Icon) -> impl egui::Widget {
+    move |ui: &mut egui::Ui| {
+        let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(ICON_BUTTON), egui::Sense::click());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), icon.name()));
         if ui.is_rect_visible(rect) {
-            let (visuals, state) = (ui.visuals(), ui.style().interact(&response));
-            let (fill, color) = match lit {
-                true if response.hovered() => (visuals.selection.bg_fill.lerp_to_gamma(egui::Color32::WHITE, 0.1), egui::Color32::WHITE),
-                true => (visuals.selection.bg_fill, egui::Color32::WHITE),
-                false => (state.weak_bg_fill, state.fg_stroke.color),
-            };
-            let painter = ui.painter();
-            painter.rect_filled(rect, 4.0, fill);
-            draw_icon(painter, icon, rect.center(), egui::Stroke::new(1.5, color));
-            if lit {
-                let orange = egui::Color32::from_rgb(0xff, 0x8f, 0x00);
-                painter.circle(rect.right_top() + egui::vec2(-3.5, 3.5), 4.5, orange, egui::Stroke::new(2.0, visuals.panel_fill));
-            }
+            let state = ui.style().interact(&response);
+            ui.painter().rect_filled(rect, 8.0, state.weak_bg_fill);
+            draw_icon(ui.painter(), icon, rect.center(), 20.0, egui::Stroke::new(1.5, state.fg_stroke.color));
         }
         response
     }
 }
 
-/// Draw `icon` round `center`, 17 points across, from the drawing on a
-/// 20 by 20 grid that the mockups have.
-fn draw_icon(painter: &egui::Painter, icon: Icon, center: egui::Pos2, stroke: egui::Stroke) {
-    let scale = 17.0 / 20.0;
+/// A button of the title bar, as tall as the banner: it lights up under the
+/// pointer, and the one that closes the window does so in red, as on Windows.
+fn window_button(icon: Icon) -> impl egui::Widget {
+    move |ui: &mut egui::Ui| {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(WINDOW_BUTTON, BANNER), egui::Sense::click());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), icon.name()));
+        if ui.is_rect_visible(rect) {
+            let white = egui::Color32::WHITE;
+            let fill = match (icon, response.hovered()) {
+                (_, false) => egui::Color32::TRANSPARENT,
+                (Icon::Close, true) => egui::Color32::from_rgb(0xc4, 0x2b, 0x1c),
+                (_, true) => white.gamma_multiply(0.14),
+            };
+            ui.painter().rect_filled(rect, 0.0, fill);
+            draw_icon(ui.painter(), icon, rect.center(), 12.5, egui::Stroke::new(1.0, white));
+        }
+        response.on_hover_text(icon.name())
+    }
+}
+
+/// News of a release, on the banner: a dot in the colour of news and the
+/// words, in a pill to press.
+fn release_pill(words: String) -> impl egui::Widget {
+    move |ui: &mut egui::Ui| {
+        let white = egui::Color32::WHITE;
+        let text = ui.painter().layout_no_wrap(words.clone(), egui::FontId::proportional(13.0), white);
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(text.size().x + 35.0, 24.0), egui::Sense::click());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), &words));
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter();
+            painter.rect_filled(rect, rect.height() / 2.0, white.gamma_multiply(if response.hovered() { 0.28 } else { 0.16 }));
+            painter.circle_filled(egui::pos2(rect.left() + 13.0, rect.center().y), 4.0, NEWS);
+            painter.galley(egui::pos2(rect.left() + 23.0, rect.center().y - text.size().y / 2.0), text, white);
+        }
+        response
+    }
+}
+
+/// Draw `icon` round `center`, `size` points across, from its drawing on a
+/// 20 by 20 grid. The window's buttons fill the grid from 2 to 18.
+fn draw_icon(painter: &egui::Painter, icon: Icon, center: egui::Pos2, size: f32, stroke: egui::Stroke) {
+    let scale = size / 20.0;
     let at = |x: f32, y: f32| center + egui::vec2(x - 10.0, y - 10.0) * scale;
     let line = |points: &[(f32, f32)]| painter.add(egui::Shape::line(points.iter().map(|&(x, y)| at(x, y)).collect(), stroke));
+    let square = |from: (f32, f32), to: (f32, f32)| {
+        painter.rect_stroke(egui::Rect::from_min_max(at(from.0, from.1), at(to.0, to.1)), 2.0 * scale, stroke, egui::StrokeKind::Middle)
+    };
     match icon {
-        Icon::Update => {
-            // Round the middle, clockwise, in degrees from the right.
-            let arc = |from: f32, to: f32| {
-                let points = (0..=16).map(|step| (from + (to - from) * step as f32 / 16.0).to_radians())
-                    .map(|angle| at(10.0 + 6.5 * angle.cos(), 10.0 + 6.5 * angle.sin())).collect();
-                painter.add(egui::Shape::line(points, stroke));
-            };
-            arc(0.0, 141.9); // From the right, under, to the lower left.
-            arc(180.0, 321.9); // From the left, over, to the upper right.
-            line(&[(15.6, 2.8), (15.6, 6.2), (12.2, 6.2)]);
-            line(&[(4.4, 17.2), (4.4, 13.8), (7.8, 13.8)]);
-        }
         Icon::Log => {
-            painter.rect_stroke(egui::Rect::from_min_max(at(2.0, 3.5), at(18.0, 16.5)), 2.0 * scale, stroke, egui::StrokeKind::Middle);
+            square((2.0, 3.5), (18.0, 16.5));
             line(&[(5.5, 8.0), (8.5, 10.3), (5.5, 12.6)]);
             line(&[(10.5, 13.0), (14.5, 13.0)]);
         }
+        Icon::Minimize => {
+            line(&[(2.0, 10.0), (18.0, 10.0)]);
+        }
+        Icon::Maximize => {
+            square((2.0, 2.0), (18.0, 18.0));
+        }
+        Icon::Restore => {
+            square((2.0, 5.5), (14.5, 18.0));
+            line(&[(5.5, 5.5), (5.5, 2.0), (18.0, 2.0), (18.0, 14.5), (14.5, 14.5)]);
+        }
+        Icon::Close => {
+            line(&[(2.0, 2.0), (18.0, 18.0)]);
+            line(&[(18.0, 2.0), (2.0, 18.0)]);
+        }
+    }
+}
+
+/// Which way a press at `at` resizes a window that fills `room`: none
+/// unless it is within `EDGE` of an edge, and both ways within `CORNER` of
+/// a corner along it.
+pub fn edge_at(room: egui::Rect, at: egui::Pos2) -> Option<egui::ResizeDirection> {
+    use egui::ResizeDirection::*;
+    let (west, east) = (at.x - room.left(), room.right() - at.x);
+    let (north, south) = (at.y - room.top(), room.bottom() - at.y);
+    if west.min(east).min(north).min(south) >= EDGE {
+        return None;
+    }
+    Some(match (north < CORNER, south < CORNER, west < CORNER, east < CORNER) {
+        (true, _, true, _) => NorthWest,
+        (true, _, _, true) => NorthEast,
+        (_, true, true, _) => SouthWest,
+        (_, true, _, true) => SouthEast,
+        (true, ..) => North,
+        (_, true, ..) => South,
+        (_, _, true, _) => West,
+        _ => East,
+    })
+}
+
+/// The borders the system would have drawn: a strip along each edge of the
+/// window, where the pointer shows which way a press resizes it. They lie
+/// over everything else, so that a press there reaches nothing underneath.
+/// A window that fills the screen has none.
+fn resize_edges(ctx: &egui::Context) {
+    let filling = |viewport: &egui::ViewportInfo| viewport.maximized.unwrap_or(false) || viewport.fullscreen.unwrap_or(false);
+    if ctx.input(|input| filling(input.viewport())) {
+        return;
+    }
+    let room = ctx.content_rect();
+    let strips = [
+        ("north", room.with_max_y(room.top() + EDGE)),
+        ("south", room.with_min_y(room.bottom() - EDGE)),
+        ("west", room.with_max_x(room.left() + EDGE)),
+        ("east", room.with_min_x(room.right() - EDGE)),
+    ];
+    for (name, strip) in strips {
+        let area = egui::Area::new(egui::Id::unique(("edge", name))).order(egui::Order::Foreground).fixed_pos(strip.min);
+        area.show(ctx, |ui| {
+            let (_, response) = ui.allocate_exact_size(strip.size(), egui::Sense::click_and_drag());
+            let Some(direction) = response.hover_pos().and_then(|at| edge_at(room, at)) else { return };
+            use egui::{CursorIcon as Pointer, ResizeDirection as To};
+            ctx.set_cursor_icon(match direction {
+                To::North => Pointer::ResizeNorth,
+                To::South => Pointer::ResizeSouth,
+                To::East => Pointer::ResizeEast,
+                To::West => Pointer::ResizeWest,
+                To::NorthEast => Pointer::ResizeNorthEast,
+                To::SouthEast => Pointer::ResizeSouthEast,
+                To::NorthWest => Pointer::ResizeNorthWest,
+                To::SouthWest => Pointer::ResizeSouthWest,
+            });
+            if ui.input(|input| input.pointer.primary_pressed()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+            }
+        });
     }
 }
 

@@ -2,6 +2,8 @@
 # Render the program icon from its SVG sources, after editing them:
 #   icon.ico  every Windows size; build.rs puts it in the .exe
 #   icon.png  256 px; the window and taskbar icon, set in src/gui.rs
+#   mark.png  the head alone, three times the size src/gui.rs draws it on
+#             the banner
 #
 # icon-small.svg is drawn for 16 to 24 px and icon.svg for the rest.
 # Needs rsvg-convert (librsvg), ImageMagick 7 and python3.
@@ -21,6 +23,7 @@ done
 
 magick "$tmp"/{16,20,24,32,40,48,64}.png "$tmp/small.ico"
 cp "$tmp/256.png" icon.png
+rsvg-convert -w 108 -h 90 mark.svg -o mark.png
 
 # ImageMagick stores every size as an uncompressed bitmap. Add the 256 px
 # size as PNG instead, as Windows allows, which keeps 250 KB out of the .exe.
