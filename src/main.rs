@@ -44,15 +44,15 @@ put there, and nothing else is ever removed.
 
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);
+    log::start(if args.len() == 0 { "window" } else { "terminal" });
+    update::remove_old();
     if args.len() == 0 {
-        log::start("window");
         hide_console();
         return match gui::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(&format!("could not open the window: {error}")),
         };
     }
-    log::start("terminal");
     let (mut package, mut output, mut jobs, mut depots, mut list) = (None, None, DEFAULT_JOBS, None, false);
     let mut log_file = None;
     while let Some(arg) = args.next() {

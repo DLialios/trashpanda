@@ -1060,7 +1060,7 @@ fn updater(server: &Server, platform: &str, current: &str) -> update::Updater {
 }
 
 /// Install `release` over a stand-in for the program at `exe`, copying it into
-/// place as `self_replace` does.
+/// place.
 fn install(updater: &update::Updater, release: &update::Release, exe: &Path) -> anyhow::Result<()> {
     updater.install_at(release, exe, |staged| {
         #[cfg(unix)]
@@ -1169,6 +1169,73 @@ fn a_second_update_cannot_spoil_the_first_ones_build() {
     }).unwrap();
     assert_eq!(fs::read(&exe).unwrap(), NEW_BUILD);
     assert!(!staged_left(&temp.0));
+}
+
+/// The files an update left behind in `dir`, by name.
+fn left_behind(dir: &Path) -> Vec<String> {
+    let names = fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned());
+    names.filter(|name| name.starts_with(update::STAGED)).collect()
+}
+
+#[test]
+fn moves_the_running_program_aside_and_removes_it_later() {
+    let server = release_with(LINUX, NEW_BUILD, NEW_SIGNATURE);
+    let updater = updater(&server, "linux-x86_64", "0.2.0");
+    let release = updater.check().unwrap().unwrap();
+    let temp = TempDir::new("swap-aside");
+    let exe = temp.0.join("trashpanda");
+    fs::write(&exe, OLD_BUILD).unwrap();
+    updater.install_at(&release, &exe, |staged| update::swap_aside(&exe, staged)).unwrap();
+    assert_eq!(fs::read(&exe).unwrap(), NEW_BUILD);
+    // The old program is kept whole, as it is still running.
+    let [old] = &left_behind(&temp.0)[..] else { panic!("{:?}", left_behind(&temp.0)) };
+    assert!(old.ends_with(".old"), "{old}");
+    assert_eq!(fs::read(temp.0.join(old)).unwrap(), OLD_BUILD);
+    // The next start removes it, and nothing else.
+    let others = [".trashpanda-update-7-0", "notes.old", ".trashpanda-installed.json"];
+    others.iter().for_each(|name| fs::write(temp.0.join(name), b"keep").unwrap());
+    assert_eq!(update::remove_old_in(&temp.0), 0);
+    assert_eq!(left_behind(&temp.0), [".trashpanda-update-7-0"]);
+    assert!(others.iter().all(|name| temp.0.join(name).exists()));
+    assert_eq!(fs::read(&exe).unwrap(), NEW_BUILD);
+    assert_eq!(update::remove_old_in(&temp.0.join("missing")), 0);
+}
+
+#[test]
+fn puts_the_program_back_when_the_new_build_cannot_take_its_place() {
+    let temp = TempDir::new("swap-back");
+    let exe = temp.0.join("trashpanda");
+    fs::write(&exe, OLD_BUILD).unwrap();
+    assert!(update::swap_aside(&exe, &temp.0.join(".trashpanda-update-7-0")).is_err());
+    assert_eq!(fs::read(&exe).unwrap(), OLD_BUILD);
+    assert!(!staged_left(&temp.0));
+}
+
+#[test]
+fn refuses_to_install_where_the_program_no_longer_is() {
+    let server = release_with(LINUX, NEW_BUILD, NEW_SIGNATURE);
+    let updater = updater(&server, "linux-x86_64", "0.2.0");
+    let release = updater.check().unwrap().unwrap();
+    let temp = TempDir::new("replaced");
+    // What Linux calls a program that was replaced while it ran.
+    let exe = temp.0.join("trashpanda (deleted)");
+    let error = install(&updater, &release, &exe).unwrap_err();
+    assert!(error.to_string().contains("it was moved or updated while it ran"), "{error}");
+    assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 0);
+    assert!(!server.requests.lock().unwrap().iter().any(|path| path.contains(LINUX)));
+}
+
+/// `cargo test --release` makes a build that would replace the test program.
+#[cfg(debug_assertions)]
+#[test]
+fn never_replaces_a_debug_build() {
+    let server = release_with(LINUX, NEW_BUILD, NEW_SIGNATURE);
+    let updater = updater(&server, "linux-x86_64", "0.2.0");
+    let release = updater.check().unwrap().unwrap();
+    let error = updater.install(&release).unwrap_err();
+    assert!(error.to_string().contains("this is a debug build, which is never replaced"), "{error}");
+    assert!(error.to_string().contains("/releases/tag/v0.3.0"), "{error}");
+    assert!(!server.requests.lock().unwrap().iter().any(|path| path.contains(LINUX)));
 }
 
 #[test]

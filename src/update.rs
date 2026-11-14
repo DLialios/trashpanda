@@ -7,6 +7,15 @@
 //! key compiled in here, for this platform, as the version `latest.json`
 //! offers, and that version is newer than this one. Access to the GitHub
 //! account alone can hold updates back, but cannot ship one.
+//!
+//! The build is written next to the running program and renamed into its
+//! place. Windows cannot replace or delete a running program, only rename
+//! it, so there the old program is moved aside first, and the new version
+//! deletes it when it starts.
+//!
+//! A debug build, which is what `cargo run` makes, checks for updates like
+//! any other but is never replaced: the release would take the place of the
+//! build in `target/` until cargo next put its own back.
 
 use std::fmt;
 use std::fs::{self, File};
@@ -30,6 +39,12 @@ const PUBLIC_KEY: &str = include_str!("../minisign.pub");
 /// How the name of the file a new build is written to, next to the running
 /// program, starts. Each update attempt writes to a file of its own.
 pub const STAGED: &str = ".trashpanda-update";
+/// How the name of a program that an update moved aside ends, after the
+/// name of the file the new build was written to.
+#[cfg(any(windows, test))]
+const OLD: &str = ".old";
+/// Whether this build replaces itself with a newer release.
+pub const REPLACES_ITSELF: bool = !cfg!(debug_assertions);
 
 /// A `major.minor.patch` version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -189,12 +204,11 @@ impl Updater {
     /// Download and check the release, and swap it in for the running
     /// program. Returns the program's path, to start the new version from.
     pub fn install(&self, release: &Release) -> Result<PathBuf> {
+        ensure!(REPLACES_ITSELF, "this is a debug build, which is never replaced; version {} is at {}",
+                release.version, release.page);
         let exe = std::env::current_exe().context("could not find the running program")?;
         log::write(format!("update: installing version {} over {exe:?}", release.version));
-        #[cfg(windows)]
-        self.install_at(release, &exe, |staged| swap_on_windows(&exe, staged))?;
-        #[cfg(not(windows))]
-        self.install_at(release, &exe, |staged| self_replace::self_replace(staged))?;
+        self.install_at(release, &exe, |staged| swap(&exe, staged))?;
         Ok(exe)
     }
 
@@ -203,6 +217,11 @@ impl Updater {
     /// so that renaming it into place stays on one drive.
     pub fn install_at(&self, release: &Release, exe: &Path, swap: impl FnOnce(&Path) -> io::Result<()>) -> Result<()> {
         let dir = exe.parent().context("the program has no folder")?;
+        // On Linux a program that was replaced or deleted while it ran is
+        // reported at its old path with " (deleted)" added, and the build
+        // would be installed under that name.
+        ensure!(exe.is_file(), "the program is no longer at {}: it was moved or updated while it ran. \
+                                Close it and start it again.", exe.display());
         let unwritable = |error| anyhow!(Unwritable { dir: dir.into(), page: release.page.clone(), error });
         // Find out whether the folder is writable before downloading anything.
         let (staged, mut file) = create_staged(dir).map_err(unwritable)?;
@@ -239,24 +258,72 @@ fn create_staged(dir: &Path) -> io::Result<(PathBuf, File)> {
     }
 }
 
-/// Put the build at `staged` in place of the running program at `exe`.
-/// `self_replace` moves the program aside before copying the build in, so
-/// a failed copy (a full drive, say) leaves no program at all. Renaming
-/// within the folder needs no space, and the first rename is undone if the
-/// second fails. The old program is deleted once this process exits.
-#[cfg(windows)]
-fn swap_on_windows(exe: &Path, staged: &Path) -> io::Result<()> {
+/// Put the build at `staged`, in the program's folder, in place of the
+/// running program at `exe`.
+fn swap(exe: &Path, staged: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    return swap_aside(exe, staged);
+    // The running program keeps the file it was started from, which goes
+    // once it exits.
+    #[cfg(not(windows))]
+    fs::rename(staged, exe)
+}
+
+/// `swap` where a running program can be renamed but not replaced: move
+/// the program aside, then the build into its place. Renaming within the
+/// folder needs no space, so a full drive cannot leave a half-written
+/// program, and the first rename is undone if the second fails. The old
+/// program stays, as `<staged>.old`, until `remove_old` finds it.
+#[cfg(any(windows, test))]
+pub fn swap_aside(exe: &Path, staged: &Path) -> io::Result<()> {
     let mut old = staged.as_os_str().to_owned();
-    old.push(".old");
+    old.push(OLD);
     let old = PathBuf::from(old);
     fs::rename(exe, &old)?;
     if let Err(error) = fs::rename(staged, exe) {
         _ = fs::rename(&old, exe);
         return Err(error);
     }
-    // Should this fail, the old program is left behind as a stray file.
-    _ = self_replace::self_delete_at(&old);
     Ok(())
+}
+
+/// Delete the programs that updates moved aside in the folder of this one,
+/// on a thread of its own. The program that started this one after its
+/// update may take a moment to exit, and Windows keeps its file until then,
+/// so this tries for a while; what is left then goes at a later start.
+pub fn remove_old() {
+    #[cfg(windows)]
+    if let Some(dir) = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.to_path_buf())) {
+        std::thread::spawn(move || {
+            for wait in [0, 1, 2, 4, 8] {
+                std::thread::sleep(Duration::from_secs(wait));
+                if remove_old_in(&dir) == 0 {
+                    return;
+                }
+            }
+            log::write(format!("update: an old program in {dir:?} is still running or cannot be deleted"));
+        });
+    }
+}
+
+/// Delete the programs that updates moved aside in `dir`, and return how
+/// many could not be deleted. Windows refuses for a program that is still
+/// running, so one that may yet have to undo its update keeps its file.
+#[cfg(any(windows, test))]
+pub fn remove_old_in(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else { return 0 };
+    let old = entries.flatten().filter(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(STAGED) && name.ends_with(OLD)
+    });
+    old.filter(|entry| match fs::remove_file(entry.path()) {
+        Ok(()) => {
+            log::write(format!("update: removed the old program {:?}", entry.path()));
+            false
+        }
+        Err(_) => true,
+    }).count()
 }
 
 /// Start the program at `exe` again, which opens its window; this process

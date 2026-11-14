@@ -301,12 +301,20 @@ impl App {
             }
             Update::Available(release) => {
                 let release = release.clone();
-                let button = ui.add_enabled(!downloading, egui::Button::new("Update"));
-                if button.on_disabled_hover_text("Pause the download first; Resume continues it afterwards").clicked() {
+                // Why it cannot be installed now: in a few words, and in full.
+                let blocked = if !update::REPLACES_ITSELF {
+                    Some(("Debug build", "A debug build is never replaced by an update"))
+                } else if downloading {
+                    Some(("Pause to update", "Pause the download first; Resume continues it afterwards"))
+                } else {
+                    None
+                };
+                let button = ui.add_enabled(blocked.is_none(), egui::Button::new("Update"));
+                if button.on_disabled_hover_text(blocked.map_or("", |(_, why)| why)).clicked() {
                     self.install_update(release.clone());
                 }
-                if downloading {
-                    ui.weak("Pause to update");
+                if let Some((label, _)) = blocked {
+                    ui.weak(label);
                 }
                 ui.hyperlink_to(format!("Version {} is available", release.version), &release.page)
                     .on_hover_text("What is new in it");
