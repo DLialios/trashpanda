@@ -205,11 +205,20 @@ fn status_line(progress: &Progress, meter: &mut Meter) -> String {
 /// it for the GUI, but keep the console of a terminal it was started from.
 #[cfg(windows)]
 fn hide_console() {
-    use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    use windows_sys::Win32::System::Console::{
+        FreeConsole, GetConsoleProcessList, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    };
     let mut processes = [0u32; 2];
     unsafe {
-        if GetConsoleProcessList(processes.as_mut_ptr(), 2) == 1 {
-            FreeConsole();
+        if GetConsoleProcessList(processes.as_mut_ptr(), 2) == 1 && FreeConsole() != 0 {
+            // FreeConsole closes the standard handles but leaves this process
+            // pointing at them. Starting a program hands it copies of them,
+            // which fails for a closed handle ("The handle is invalid", OS
+            // error 6), so the restart after an update did. Without any, a
+            // program starts fine.
+            for handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                SetStdHandle(handle, std::ptr::null_mut());
+            }
         }
     }
 }
