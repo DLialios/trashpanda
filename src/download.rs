@@ -187,7 +187,7 @@ impl Target<'_> {
 }
 
 /// Where every entry of `package` goes: the folders, then the files. Refuses
-/// unsafe paths and two files at one path, and touches nothing on disk.
+/// unsafe paths and two different files at one path, and touches nothing on disk.
 fn plan<'a>(package: &'a Package, output: &Path) -> Result<(Vec<PathBuf>, Vec<Target<'a>>)> {
     let (mut folders, mut files, mut seen) = (Vec::new(), Vec::new(), HashMap::new());
     for depot in &package.depots {
@@ -197,18 +197,28 @@ fn plan<'a>(package: &'a Package, output: &Path) -> Result<(Vec<PathBuf>, Vec<Ta
                 folders.push(path);
                 continue;
             }
-            // Depots may share folders, but two files at one path would corrupt each other.
+            // Depots may share folders, and files that are the same in each,
+            // as Team Fortress 2's do; but two different files at one path
+            // would corrupt each other.
             let unique = if cfg!(windows) { entry.name.to_lowercase() } else { entry.name.clone() };
-            match seen.insert(unique, depot.id) {
-                Some(other) if other == depot.id => bail!("depot {other} lists {:?} twice", entry.name),
-                Some(other) => bail!("depots {other} and {} both contain {:?}; choose only one of them",
-                                     depot.id, entry.name),
+            match seen.insert(unique, (depot.id, entry)) {
+                Some((other, _)) if other == depot.id => bail!("depot {other} lists {:?} twice", entry.name),
+                Some((_, first)) if same_content(first, entry) => continue, // The first depot's target writes it.
+                Some((other, _)) => bail!("depots {other} and {} both contain {:?}; choose only one of them",
+                                          depot.id, entry.name),
                 None => {}
             }
             files.push(Target { path, entry, depot });
         }
     }
     Ok((folders, files))
+}
+
+/// Whether two files hold the same bytes: the same size, and the same chunks
+/// at the same offsets.
+fn same_content(a: &Entry, b: &Entry) -> bool {
+    a.size == b.size && a.chunks.len() == b.chunks.len()
+        && a.chunks.iter().zip(&b.chunks).all(|(a, b)| (a.sha, a.offset, a.size) == (b.sha, b.offset, b.size))
 }
 
 /// What is already in an output folder: for each file found, its length and
@@ -222,6 +232,10 @@ pub struct OnDisk {
     elsewhere: HashMap<[u8; 20], (PathBuf, u64)>,
     /// The files already searched for such chunks.
     searched: HashSet<PathBuf>,
+    /// The chunks, with their checksums, that every file in `searched` was
+    /// searched for, unless `elsewhere` already knew where one was. Depots
+    /// ticked later may want others, and then every file is searched again.
+    sought: HashMap<[u8; 20], u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -277,7 +291,8 @@ fn check_files(targets: &[Target], previous: Option<&OnDisk>, progress: &Progres
     let started = Instant::now();
     let mut on_disk = OnDisk::default();
     if let Some(previous) = previous {
-        (on_disk.elsewhere, on_disk.searched) = (previous.elsewhere.clone(), previous.searched.clone());
+        (on_disk.elsewhere, on_disk.searched, on_disk.sought) =
+            (previous.elsewhere.clone(), previous.searched.clone(), previous.sought.clone());
     }
     let mut queue = Vec::new();
     let (mut present, mut reused) = (0, 0);
@@ -362,7 +377,8 @@ fn find_elsewhere(targets: &[Target], stale: &[PathBuf], on_disk: &mut OnDisk, p
             }
         }
     }
-    on_disk.elsewhere.retain(|sha, _| missing.contains_key(sha));
+    // What is known of chunks the depots ticked now do not want is kept, as
+    // they may be ticked again; each is checked again before it is copied.
     if !missing.is_empty() {
         // A chunk the package has twice may be in place at one of the two.
         for target in targets {
@@ -376,6 +392,18 @@ fn find_elsewhere(targets: &[Target], stale: &[PathBuf], on_disk: &mut OnDisk, p
     let wanted: Vec<([u8; 20], u32)> = missing.values()
         .filter(|chunk| chunk.size as usize == moved::WINDOW && !on_disk.elsewhere.contains_key(&chunk.sha))
         .map(|chunk| (chunk.sha, chunk.sum))
+        .collect();
+    // A file searched before was not searched for chunks not wanted then.
+    if wanted.iter().any(|(sha, _)| !on_disk.sought.contains_key(sha)) {
+        on_disk.searched.clear();
+    }
+    // Files not searched yet are searched for everything the others were, so
+    // that all of them stay searched for the same chunks.
+    let searching = !wanted.is_empty();
+    on_disk.sought.extend(wanted);
+    let wanted: Vec<([u8; 20], u32)> = on_disk.sought.iter()
+        .filter(|(sha, _)| !on_disk.elsewhere.contains_key(*sha))
+        .map(|(sha, sum)| (*sha, *sum))
         .collect();
 
     // Where an older version's content may be: wherever a file does not hold
@@ -412,8 +440,9 @@ fn find_elsewhere(targets: &[Target], stale: &[PathBuf], on_disk: &mut OnDisk, p
     }
     let size: u64 = regions.iter().map(|region| region.end - region.start).sum();
     log::write(format!("search: {} chunks missing, {} of them known elsewhere, {} to look for in {size} bytes of {} files",
-                       missing.len(), on_disk.elsewhere.len(), wanted.len(), regions.len()));
-    if !wanted.is_empty() && !regions.is_empty() {
+                       missing.len(), missing.keys().filter(|sha| on_disk.elsewhere.contains_key(*sha)).count(),
+                       wanted.len(), regions.len()));
+    if searching && !regions.is_empty() {
         progress.log(format!("Looking through {} that an older version left for content this one still has.", human(size)));
         let threads = thread::available_parallelism().map_or(4, |n| n.get()).min(16);
         let places = moved::search(&files, &regions, &wanted, threads, &progress.stop);
@@ -424,7 +453,10 @@ fn find_elsewhere(targets: &[Target], stale: &[PathBuf], on_disk: &mut OnDisk, p
     if progress.stop.load(Relaxed) {
         return false;
     }
-    on_disk.searched.extend(files.into_iter().chain(stale.iter().cloned()));
+    // Files not searched, as nothing was wanted, may still hold what is wanted later.
+    if searching {
+        on_disk.searched.extend(files.into_iter().chain(stale.iter().cloned()));
+    }
     let mut elsewhere = 0;
     for target in targets {
         for (c, chunk) in target.entry.chunks.iter().enumerate() {
@@ -705,7 +737,7 @@ fn tidy(target: &Target) -> io::Result<bool> {
     if cut {
         file.set_len(target.entry.size)?;
     }
-    set_mode(&file, target.entry)?;
+    set_mode(&file)?;
     Ok(cut)
 }
 
@@ -828,14 +860,17 @@ pub fn destination(root: &Path, name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Make a file executable, as the Steam client makes every file it installs:
+/// few depots mark their programs as such, so a game whose programs went by
+/// the mark would not start.
 #[cfg(unix)]
-fn set_mode(file: &File, entry: &Entry) -> io::Result<()> {
+fn set_mode(file: &File) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(fs::Permissions::from_mode(if entry.is_executable() { 0o755 } else { 0o644 }))
+    file.set_permissions(fs::Permissions::from_mode(0o755))
 }
 
 #[cfg(not(unix))]
-fn set_mode(_: &File, _: &Entry) -> io::Result<()> {
+fn set_mode(_: &File) -> io::Result<()> {
     Ok(())
 }
 

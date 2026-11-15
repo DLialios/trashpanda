@@ -13,8 +13,6 @@ use crate::log;
 
 /// Largest chunk accepted from a manifest. Steam uses chunks of at most 1 MiB.
 const MAX_CHUNK: u32 = 32 << 20;
-#[cfg(unix)]
-const FLAG_EXECUTABLE: u32 = 32;
 const FLAG_DIRECTORY: u32 = 64;
 const FLAG_SYMLINK: u32 = 512;
 
@@ -42,10 +40,6 @@ pub struct Entry {
 impl Entry {
     pub fn is_dir(&self) -> bool {
         self.flags & FLAG_DIRECTORY != 0
-    }
-    #[cfg(unix)]
-    pub fn is_executable(&self) -> bool {
-        self.flags & FLAG_EXECUTABLE != 0
     }
 }
 
@@ -385,10 +379,12 @@ pub fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Decode base64 as Valve writes it: in lines, with a line break at the end.
 fn base64(text: &str) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let (mut bits, mut count) = (0u32, 0);
-    for c in text.trim_end_matches('=').bytes() {
+    let text = text.trim_end_matches(|c: char| c == '=' || c.is_ascii_whitespace());
+    for c in text.bytes().filter(|c| !c.is_ascii_whitespace()) {
         let value = match c {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,

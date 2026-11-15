@@ -205,26 +205,36 @@ fn lua(keys: &[(u32, Key)]) -> String {
 fn reads_raw_zipped_and_encrypted_manifests() {
     let fixture = fixture();
     let keys = HashMap::from([(123, KEY)]);
-    for encrypted in [false, true] {
-        for wrap in [false, true] {
-            let name = if encrypted {
-                let encoded = encrypt(b"folder\\game.bin\0");
-                base64(&encoded).into_bytes()
-            } else {
-                b"folder\\game.bin".to_vec()
-            };
-            let mut data = manifest(&[fixture.mapping(&name)], encrypted);
-            if wrap {
-                data = zipped(&[("z", &data)]);
+    // The long name takes more than one line of base64.
+    for plain in ["folder/game.bin", "folder/a name long enough to take two lines of base64.bin"] {
+        for encrypted in [false, true] {
+            for wrap in [false, true] {
+                let name = plain.replace('/', "\\");
+                let name = if encrypted {
+                    let encoded = encrypt(format!("{name}\0").as_bytes());
+                    lines(&base64(&encoded)).into_bytes()
+                } else {
+                    name.into_bytes()
+                };
+                let mut data = manifest(&[fixture.mapping(&name)], encrypted);
+                if wrap {
+                    data = zipped(&[("z", &data)]);
+                }
+                let depot = depot::parse_manifest(&data, &keys, &mut Vec::new()).unwrap().unwrap();
+                assert_eq!((depot.id, depot.manifest), (123, 9876543210123456789));
+                assert_eq!(depot.entries[0].name, plain);
+                let offsets: Vec<u64> = depot.entries[0].chunks.iter().map(|c| c.offset).collect();
+                assert_eq!(offsets, [0, 8000, 8000 + 5400]);
             }
-            let depot = depot::parse_manifest(&data, &keys, &mut Vec::new()).unwrap().unwrap();
-            assert_eq!((depot.id, depot.manifest), (123, 9876543210123456789));
-            assert_eq!(depot.entries[0].name, "folder/game.bin");
-            let offsets: Vec<u64> = depot.entries[0].chunks.iter().map(|c| c.offset).collect();
-            assert_eq!(offsets, [0, 8000, 8000 + 5400]);
         }
     }
     assert!(depot::parse_manifest(&manifest(&[], false), &HashMap::new(), &mut Vec::new()).unwrap().is_none());
+}
+
+/// Base64 as Valve writes encrypted file names: 64 characters a line, and
+/// a line break after the last, which follows the `=` padding.
+fn lines(base64: &str) -> String {
+    base64.as_bytes().chunks(64).map(|line| String::from_utf8(line.to_vec()).unwrap() + "\n").collect()
 }
 
 fn base64(data: &[u8]) -> String {
@@ -479,7 +489,9 @@ fn downloads_resumes_and_repairs() {
     assert_eq!(run().fetched, 0);
     assert_eq!(fs::read(&target).unwrap(), fixture.data);
 
-    package.depots[1].entries.push(depot::Entry { name: "empty-file".into(), size: 0, flags: 0, chunks: Vec::new() });
+    // A file that is the same in both is allowed, but not one that differs.
+    let different = depot::Chunk { sha: [1; 20], sum: 0, offset: 0, size: 1 };
+    package.depots[1].entries.push(depot::Entry { name: "empty-file".into(), size: 1, flags: 0, chunks: vec![different] });
     let error = download::download(&package, &output, 2, &agent, &servers, None, &Progress::default()).unwrap_err();
     assert!(error.to_string().contains("depots 123 and 98 both contain \"empty-file\""), "{error}");
     // Leaving one of the two depots out avoids the clash.
@@ -1946,4 +1958,190 @@ fn long_lists_keep_their_rows_and_their_scroll_bars_clear_of_the_windows() {
     let alone = depot::Package { depots: package.depots.iter().filter(|depot| depot.id > 100).cloned().collect(), ..package.clone() };
     let (both, one) = (drawn.right_edge(), crate::gui::Drawn::new(&alone, Some(record), &[], 1000.0).right_edge());
     assert!(one - both >= 8.0, "text reaches {both} with the bar and {one} without");
+}
+
+/// Write at `path` a package with a manifest for each of `depots`, which has
+/// the files given, each one chunk, and the app's record, so that no lookup
+/// runs. `build` tells versions apart: it is added to every manifest ID.
+fn package_zip(path: &Path, depots: &[(u32, &[(&str, &[u8])])], build: u64) {
+    let mut files = vec![("game.lua".to_string(), lua(&depots.iter().map(|(id, _)| (*id, KEY)).collect::<Vec<_>>()).into_bytes()),
+                         ("appinfo/2862860.json".to_string(), record_json(2862860, "Game", &[]).into_bytes())];
+    for (id, entries) in depots {
+        let mappings: Vec<Vec<u8>> = entries.iter().map(|(name, data)| {
+            let chunk = [bytes(1, &Sha1::digest(data)), int(3, 0), int(4, data.len() as u64)].concat();
+            [bytes(1, name.as_bytes()), int(2, data.len() as u64), int(3, 0), bytes(6, &chunk)].concat()
+        }).collect();
+        let mut data = manifest(&mappings, false);
+        // IDs below 128, and manifest IDs this near the one `manifest` gives, keep their length.
+        for (before, after) in [(int(1, 123), int(1, u64::from(*id))), (int(2, 9876543210123456789), int(2, 9876543210123456789 + build))] {
+            let at = data.windows(before.len()).position(|window| window == before).unwrap();
+            data.splice(at..at + before.len(), after);
+        }
+        files.push((format!("{id}.manifest"), data));
+    }
+    let files: Vec<(&str, &[u8])> = files.iter().map(|(name, data)| (name.as_str(), &data[..])).collect();
+    fs::write(path, zipped(&files)).unwrap();
+}
+
+#[test]
+fn a_package_replaced_under_the_same_name_is_read_again() {
+    let temp = TempDir::new("replaced-package");
+    let (path, out) = (temp.0.join("2862860.zip"), temp.0.join("out"));
+    fs::create_dir(&out).unwrap();
+    let (old, new) = (b"the old build".as_slice(), b"the new build, which is longer".as_slice());
+    package_zip(&path, &[(123, &[("game.bin", old)])], 0);
+    fs::write(out.join("game.bin"), old).unwrap();
+    let mut window = crate::gui::App::looking_up_on("http://127.0.0.1:9");
+    window.set_output(&out);
+    window.open(&path);
+    window.settle();
+    assert_eq!(window.chosen_files(), [(123, "game.bin".into())]);
+    assert_eq!(window.done_and_total(), (old.len() as u64, old.len() as u64));
+    assert!(window.has_previous());
+
+    // A newer package takes the old one's name while the window is behind
+    // others: coming back to the front, the window reads it again and checks
+    // the folder again, with nothing from the check of the old one.
+    let replace = |build: u64| {
+        package_zip(&path, &[(123, &[("game.bin", new)]), (124, &[("extra.bin", b"more")])], build);
+    };
+    replace(1);
+    window.come_back();
+    window.settle();
+    assert_eq!(window.chosen_files(), [(123, "game.bin".into()), (124, "extra.bin".into())]);
+    assert_eq!(window.done_and_total(), (0, new.len() as u64 + 4));
+
+    // Choosing it again, or dropping it on the window, reads it again
+    // without the window going behind others.
+    package_zip(&path, &[(123, &[("game.bin", old)])], 2);
+    window.settle();
+    assert_eq!(window.chosen_files().len(), 2, "the file is not looked at every frame");
+    window.choose(&path);
+    window.settle();
+    assert_eq!(window.chosen_files(), [(123, "game.bin".into())]);
+    assert_eq!(window.done_and_total(), (old.len() as u64, old.len() as u64));
+
+    // A running download keeps its package until it ends.
+    replace(3);
+    window.start_idle_download();
+    window.come_back();
+    window.settle();
+    window.choose(&path);
+    window.settle();
+    assert_eq!(window.chosen_files(), [(123, "game.bin".into())]);
+    window.pause();
+    window.settle();
+    assert_eq!(window.chosen_files().len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn every_file_is_made_executable_as_steam_makes_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new("modes");
+    let mut responses = HashMap::new();
+    // Neither file is marked executable in the manifest, as is usual.
+    let mut depot = depot_of(123, &[("game.x86_64", &[b"a program"]), ("data/game.pak", &[b"its data"])], &mut responses);
+    let server = serve(&responses, false);
+    let (agent, servers) = (download::agent(1), [server.url.clone()]);
+    let run = |depot: &depot::Depot| {
+        let package = depot::Package { depots: vec![depot.clone()], ..Default::default() };
+        download::download(&package, &temp.0, 1, &agent, &servers, None, &Progress::default()).unwrap();
+    };
+    let mode = |name: &str| fs::metadata(temp.0.join(name)).unwrap().permissions().mode() & 0o777;
+    run(&depot);
+    assert_eq!((mode("game.x86_64"), mode("data/game.pak")), (0o755, 0o755));
+    // Running again, as a resume or an update does, takes no execute bit away.
+    fs::set_permissions(temp.0.join("game.x86_64"), fs::Permissions::from_mode(0o644)).unwrap();
+    run(&depot);
+    assert_eq!(mode("game.x86_64"), 0o755);
+    depot.manifest += 1;
+    run(&depot);
+    assert_eq!((mode("game.x86_64"), mode("data/game.pak")), (0o755, 0o755));
+}
+
+#[test]
+fn ticking_a_depot_again_still_copies_what_it_has_elsewhere() {
+    use moved::WINDOW;
+    let temp = TempDir::new("ticked-again");
+    let [base, dlc, moved_in] = [21, 22, 23].map(|seed| noise(seed, WINDOW));
+    let mut responses = HashMap::new();
+    // The DLC's new file takes a chunk from its own old file and one from
+    // the base game's.
+    let package = depot::Package {
+        depots: vec![depot_of(123, &[("new-base.pak", &[&base])], &mut responses),
+                     depot_of(124, &[("new-dlc.pak", &[&dlc, &moved_in])], &mut responses)],
+        ..Default::default()
+    };
+    let server = serve(&HashMap::new(), false); // Everything is on disk.
+    let (agent, servers) = (download::agent(1), [server.url.clone()]);
+    let (both, base_only, dlc_only) = (package.clone(), package.select(|id| id == 123), package.select(|id| id == 124));
+    let sequences: [&[&depot::Package]; 4] = [&[&both, &base_only, &both], &[&base_only, &both],
+                                               &[&dlc_only, &base_only, &both], &[&both, &dlc_only, &both]];
+    for sequence in sequences {
+        _ = fs::remove_dir_all(&temp.0);
+        fs::create_dir_all(&temp.0).unwrap();
+        fs::write(temp.0.join("old-base.pak"), [&base[..], &moved_in].concat()).unwrap();
+        fs::write(temp.0.join("old-dlc.pak"), &dlc).unwrap();
+        installed::Installed {
+            depots: [(123, ["old-base.pak".to_string()].into()), (124, ["old-dlc.pak".to_string()].into())].into(),
+            ..Default::default()
+        }.save(&temp.0).unwrap();
+        // Each check starts from the one before, as the window's do.
+        let mut previous = None;
+        let mut elsewhere = 0;
+        for package in sequence {
+            let progress = Progress::default();
+            previous = download::check(package, &temp.0, previous.as_ref(), &progress).unwrap();
+            elsewhere = progress.elsewhere.load(Relaxed);
+        }
+        let fresh = Progress::default();
+        download::check(&both, &temp.0, None, &fresh).unwrap();
+        assert_eq!(fresh.elsewhere.load(Relaxed), 3 * WINDOW as u64);
+        assert_eq!(elsewhere, fresh.elsewhere.load(Relaxed), "{} checks", sequence.len());
+        let summary = download::download(&both, &temp.0, 1, &agent, &servers, previous.as_ref(), &Progress::default()).unwrap();
+        assert_eq!((summary.fetched, summary.reused), (0, 3));
+        assert_eq!(fs::read(temp.0.join("new-dlc.pak")).unwrap(), [&dlc[..], &moved_in].concat());
+        assert_eq!(fs::read(temp.0.join("new-base.pak")).unwrap(), base);
+    }
+    assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn depots_may_share_a_file_that_is_the_same_in_each() {
+    let temp = TempDir::new("shared-file");
+    let out = &temp.0;
+    let (cfg, other) = (b"dxsupport".as_slice(), b"another dxsupport".as_slice());
+    let mut responses = HashMap::new();
+    // As Team Fortress 2's content depot and its Linux programs' depot do.
+    let content = depot_of(440, &[("bin/dxsupport.cfg", &[cfg]), ("tf/game.vpk", &[b"content"])], &mut responses);
+    let linux = depot_of(232253, &[("bin/dxsupport.cfg", &[cfg]), ("hl2_linux", &[b"program"])], &mut responses);
+    let clash = depot_of(441, &[("bin/dxsupport.cfg", &[other])], &mut responses);
+    let mut content2 = depot_of(440, &[("tf/game.vpk", &[b"content"])], &mut responses);
+    let mut linux2 = depot_of(232253, &[("hl2_linux", &[b"program"])], &mut responses);
+    (content2.manifest, linux2.manifest) = (content.manifest + 1, linux.manifest + 1);
+    let server = serve(&responses, false);
+    let (agent, servers) = (download::agent(1), [server.url.clone()]);
+    let run = |depots: &[&depot::Depot]| {
+        let package = depot::Package { depots: depots.iter().map(|depot| (*depot).clone()).collect(), ..Default::default() };
+        download::download(&package, out, 1, &agent, &servers, None, &Progress::default())
+    };
+
+    let summary = run(&[&content, &linux]).unwrap();
+    assert_eq!((summary.files, summary.fetched), (3, 3), "the shared file is one file, fetched once");
+    assert_eq!(fs::read(out.join("bin/dxsupport.cfg")).unwrap(), cfg);
+    assert_eq!(listed(out), [(440, vec!["bin/dxsupport.cfg".into(), "tf/game.vpk".into()]),
+                             (232253, vec!["bin/dxsupport.cfg".into(), "hl2_linux".into()])]);
+    let error = run(&[&content, &clash]).err().unwrap();
+    assert!(error.to_string().contains("depots 440 and 441 both contain \"bin/dxsupport.cfg\""), "{error}");
+
+    // The file stays while a depot that has it is in the folder, whether or
+    // not that depot is downloaded too, and goes once none has it.
+    run(&[&content2]).unwrap();
+    assert_eq!(fs::read(out.join("bin/dxsupport.cfg")).unwrap(), cfg);
+    run(&[&content2, &linux]).unwrap();
+    assert_eq!(fs::read(out.join("bin/dxsupport.cfg")).unwrap(), cfg);
+    run(&[&linux2]).unwrap();
+    assert!(!out.join("bin").exists());
+    assert_eq!(listed(out), [(440, vec!["tf/game.vpk".into()]), (232253, vec!["hl2_linux".into()])]);
 }

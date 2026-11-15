@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context as _;
 use eframe::egui;
@@ -142,13 +142,31 @@ fn blues() -> egui::ColorImage {
     egui::ColorImage::new([width, 1], (0..width).map(|x| blue_at(x as f32 / (width - 1) as f32)).collect())
 }
 
-/// What is chosen: the package path and output folder as typed, and the
-/// depots left out.
+/// What is chosen: the package path and output folder as typed, which
+/// reading of the package, and the depots left out.
 #[derive(Clone, Default, PartialEq)]
 struct Choice {
     package: String,
     output: String,
+    /// Counts the times a package was read, so that a package read again,
+    /// at the same path, is checked again: it may hold other manifests.
+    read: u64,
     skip: BTreeSet<u32>,
+}
+
+/// The package last read for display.
+struct Info {
+    /// Its path as typed.
+    path: String,
+    /// Its size and modification time when it was read, if it had them.
+    stamp: Option<(u64, Option<SystemTime>)>,
+    package: Result<Arc<Package>, String>,
+}
+
+/// The size and modification time of the file at `path`, which change when
+/// another file takes its place.
+fn stamp(path: &Path) -> Option<(u64, Option<SystemTime>)> {
+    std::fs::metadata(path).ok().map(|meta| (meta.len(), meta.modified().ok()))
 }
 
 pub struct App {
@@ -156,8 +174,19 @@ pub struct App {
     output: String,
     /// Depots not to download.
     skip: BTreeSet<u32>,
-    /// The package path last read for display, and what reading it gave.
-    info: Option<(String, Result<Arc<Package>, String>)>,
+    /// The package last read for display, and what reading it gave.
+    info: Option<Info>,
+    /// The `Choice::read` of `info`.
+    reads: u64,
+    /// Set to read the package again, though its path is unchanged: it was
+    /// chosen or dropped on the window again.
+    reread: bool,
+    /// Set to read the package again if its size or modification time
+    /// changed, as it does when a newer package replaces it under the same
+    /// name: when the window comes back to the front, and before a download.
+    restat: bool,
+    /// Whether the window was in front at the last frame.
+    focused: bool,
     picker: Picker,
     /// Where Steam's records of apps come from.
     mirror: String,
@@ -221,6 +250,10 @@ impl Default for App {
             output: String::new(),
             skip: BTreeSet::new(),
             info: None,
+            reads: 0,
+            reread: false,
+            restat: false,
+            focused: false,
             picker: Picker::default(),
             mirror: appinfo::MIRROR.into(),
             shown: Choice::default(),
@@ -240,12 +273,13 @@ impl Default for App {
 
 impl App {
     fn choice(&self) -> Choice {
-        Choice { package: self.package.trim().into(), output: self.output.trim().into(), skip: self.skip.clone() }
+        Choice { package: self.package.trim().into(), output: self.output.trim().into(), read: self.reads,
+                 skip: self.skip.clone() }
     }
 
     fn parsed(&self) -> Option<Arc<Package>> {
         match &self.info {
-            Some((_, Ok(package))) => Some(package.clone()),
+            Some(Info { package: Ok(package), .. }) => Some(package.clone()),
             _ => None,
         }
     }
@@ -257,14 +291,25 @@ impl App {
         Some(package).filter(|package| !package.depots.is_empty())
     }
 
-    /// Read the package again whenever its path changes, to show what is in it.
-    fn read_info(&mut self) {
+    /// Read the package again whenever its path changes, or `reread` or
+    /// `restat` asks for it, to show what is in it. Returns whether it was
+    /// read. While a download runs, the package it is downloading stays.
+    fn read_info(&mut self, downloading: bool) -> bool {
+        if downloading {
+            return false; // `reread` and `restat` wait for it to end.
+        }
+        let (reread, restat) = (std::mem::take(&mut self.reread), std::mem::take(&mut self.restat));
         let path = self.package.trim();
         if path.is_empty() {
             self.info = None;
             self.picker = Picker::default();
-        } else if self.info.as_ref().is_none_or(|(read, _)| read != path) {
+            return false;
+        }
+        let replaced = |info: &Info| restat && stamp(Path::new(path)) != info.stamp;
+        if self.info.as_ref().is_none_or(|info| info.path != path || reread || replaced(info)) {
             log::write(format!("gui: package {path:?}"));
+            // Before it is read, so that a change while it is read is seen next time.
+            let stamp = stamp(Path::new(path));
             let package = depot::read_package(Path::new(path)).map(Arc::new).map_err(|error| {
                 log::write(format!("gui: cannot use the package: {error:#}"));
                 log::brief(&error)
@@ -276,8 +321,12 @@ impl App {
                 Err(_) => Picker::default(),
             };
             self.skip = self.picker.skip();
-            self.info = Some((path.to_string(), package));
+            self.info = Some(Info { path: path.to_string(), stamp, package });
+            // What was found on disk for the package before is not used for this one.
+            self.reads += 1;
+            return true;
         }
+        false
     }
 
     /// Take what the lookup of the app's record has found. The record
@@ -304,11 +353,17 @@ impl App {
     /// What the last check or download found for this package and folder, so
     /// that files unchanged since are not read again.
     fn previous(&self) -> Option<Arc<OnDisk>> {
-        let same = |checked: &Choice| (&checked.package, &checked.output) == (&self.package.trim().into(), &self.output.trim().into());
+        let now = self.choice();
+        let same = |checked: &Choice| (&checked.package, &checked.output, checked.read) == (&now.package, &now.output, now.read);
         self.on_disk.as_ref().filter(|(checked, _)| same(checked)).map(|(_, on_disk)| on_disk.clone())
     }
 
     fn start(&mut self) {
+        // If another package has taken this one's place, show it instead.
+        self.restat = true;
+        if self.read_info(false) {
+            return;
+        }
         let Some(package) = self.selected() else { return };
         let (output, jobs, previous) = (PathBuf::from(self.output.trim()), crate::DEFAULT_JOBS, self.previous());
         log::write(format!("gui: download {:?} into {output:?}, skipping depots {:?}, {jobs} jobs, previous check {}",
@@ -397,7 +452,7 @@ impl App {
         let (pick, job) = self.picking.take().unwrap();
         let Ok(Some(path)) = job.join() else { return }; // Cancelled.
         match pick {
-            Pick::Package => self.package = path.display().to_string(),
+            Pick::Package => (self.package, self.reread) = (path.display().to_string(), true),
             Pick::Output => self.output = path.display().to_string(),
             Pick::Log => {
                 log::write(format!("gui: saving the log to {path:?}"));
@@ -733,9 +788,13 @@ impl eframe::App for App {
         let dropped = ui.input(|input| input.raw.dropped_files.first().map(|file| file.path().to_path_buf()));
         if let (false, Some(path)) = (downloading, dropped) {
             log::write(format!("gui: file dropped: {path:?}"));
-            self.package = path.display().to_string();
+            (self.package, self.reread) = (path.display().to_string(), true);
         }
-        self.read_info();
+        // The package may have been replaced while the window was behind others.
+        let focused = ui.input(|input| input.focused);
+        self.restat |= focused && !self.focused;
+        self.focused = focused;
+        self.read_info(downloading);
         self.collect_lookup(downloading);
         self.check();
         let checking = self.task.as_ref().is_some_and(|task| !task.download);
@@ -777,11 +836,11 @@ impl eframe::App for App {
                 self.pick(ui.ctx(), pick);
             }
             match &self.info {
-                Some((_, Ok(package))) => {
+                Some(Info { package: Ok(package), .. }) => {
                     ui.add_space(8.0);
                     show_package(ui, package, &mut self.picker, &mut self.skip, !downloading, press);
                 }
-                Some((_, Err(error))) => {
+                Some(Info { package: Err(error), .. }) => {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
                 None => welcome(ui),
@@ -1530,7 +1589,72 @@ impl App {
     /// Open the package at `path`, as typing its path would.
     pub fn open(&mut self, path: &Path) {
         self.package = path.display().to_string();
-        self.read_info();
+        self.read_info(false);
+    }
+
+    /// Choose the package at `path` in the file dialog, or drop it on the
+    /// window, as the next frame takes it.
+    pub fn choose(&mut self, path: &Path) {
+        (self.package, self.reread) = (path.display().to_string(), true);
+    }
+
+    /// Bring the window back to the front, as the next frame sees it.
+    pub fn come_back(&mut self) {
+        self.restat = true;
+    }
+
+    pub fn set_output(&mut self, path: &Path) {
+        self.output = path.display().to_string();
+    }
+
+    /// Do what a frame does before it draws anything, until no check runs,
+    /// nor a download that was paused. A download not paused keeps running.
+    pub fn settle(&mut self) {
+        let started = Instant::now();
+        loop {
+            self.collect();
+            let downloading = self.task.as_ref().is_some_and(|task| task.download);
+            self.read_info(downloading);
+            self.collect_lookup(downloading);
+            self.check();
+            if self.task.as_ref().is_none_or(|task| task.download && !self.progress.stop.load(Relaxed)) {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "the check never ended");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Start a download that fetches nothing and runs until it is paused.
+    pub fn start_idle_download(&mut self) {
+        self.spawn(true, |progress| {
+            while !progress.stop.load(Relaxed) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None)
+        });
+    }
+
+    pub fn pause(&self) {
+        self.progress.stop.store(true, Relaxed);
+    }
+
+    /// The depots, and their files, that Download would download.
+    pub fn chosen_files(&self) -> Vec<(u32, String)> {
+        let package = self.selected().into_iter();
+        package.flat_map(|package| package.depots.iter()
+                .flat_map(|depot| depot.entries.iter().map(|entry| (depot.id, entry.name.clone()))).collect::<Vec<_>>())
+            .collect()
+    }
+
+    /// What the readout says is there, and how much the depots chosen hold.
+    pub fn done_and_total(&self) -> (u64, u64) {
+        (self.progress.done.load(Relaxed), self.progress.total.load(Relaxed))
+    }
+
+    /// Whether a check would start from what was found on disk before.
+    pub fn has_previous(&self) -> bool {
+        self.previous().is_some()
     }
 
     /// Take what the lookup found, and say whether it is still running.

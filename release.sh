@@ -6,10 +6,10 @@
 #   2. Run ./release.sh. minisign asks for the key's password once per build.
 #
 # Needs cargo with the x86_64-pc-windows-gnu target, mingw-w64-gcc, minisign,
-# jq, and gh logged in. The secret key is ~/.minisign/trashpanda.key, or
-# $MINISIGN_KEY. Every build carries minisign.pub and refuses updates signed
-# with any other key, so if the secret key is lost, a build with a new key has
-# to be handed out by hand.
+# jq, objdump, docker that this user may run, and gh logged in. The secret key
+# is ~/.minisign/trashpanda.key, or $MINISIGN_KEY. Every build carries
+# minisign.pub and refuses updates signed with any other key, so if the secret
+# key is lost, a build with a new key has to be handed out by hand.
 #
 # The release is created as a draft holding all its files and only then
 # published, so releases/latest never points at a release with files missing.
@@ -22,13 +22,19 @@ cd "$(dirname "$0")"
 repo=DLialios/trashpanda
 key=${MINISIGN_KEY:-$HOME/.minisign/trashpanda.key}
 windows=x86_64-pc-windows-gnu
+# The Linux build is made in Debian 11, with the Rust used here, so that it
+# runs on any system with glibc 2.31 or newer: one made on this machine needs
+# the glibc of this machine, and does not start on older systems.
+glibc=2.31
+image=rust:$(rustc --version | cut -d' ' -f2)-bullseye
+linux=target/glibc-$glibc
 
 die() {
     echo "release.sh: $*" >&2
     exit 1
 }
 
-for tool in cargo gh jq minisign x86_64-w64-mingw32-gcc; do
+for tool in cargo docker gh jq minisign objdump x86_64-w64-mingw32-gcc; do
     command -v "$tool" >/dev/null || die "$tool is not installed"
 done
 [[ -f $key ]] || die "no signing key at $key (set MINISIGN_KEY)"
@@ -45,13 +51,23 @@ git fetch -q origin
 [[ -n $(git branch -r --contains "$commit") ]] || die "push $commit to GitHub first"
 
 cargo test --locked --quiet
-cargo build --locked --release
+# As this user, so that what it leaves in target/ is theirs; with a cargo
+# home of its own there, so that the crates it fetches stay for next time.
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/src" -w /src \
+    -e CARGO_HOME="/src/$linux/cargo" -e CARGO_TARGET_DIR="/src/$linux" \
+    "$image" cargo build --locked --release
 cargo build --locked --release --target "$windows"
+
+# The newest glibc symbol the Linux build uses must be no newer than $glibc.
+needs=$(objdump -T "$linux/release/trashpanda" | grep -o 'GLIBC_[0-9.]*' | cut -d_ -f2 | sort -uV | tail -n 1)
+[[ -n $needs ]] || die "found no glibc symbols in $linux/release/trashpanda"
+[[ $(printf '%s\n' "$glibc" "$needs" | sort -V | tail -n 1) == "$glibc" ]] ||
+    die "the Linux build needs glibc $needs, newer than $glibc"
 
 out=target/release-$tag
 rm -rf "$out"
 mkdir -p "$out"
-cp target/release/trashpanda "$out/trashpanda-linux-x86_64"
+cp "$linux/release/trashpanda" "$out/trashpanda-linux-x86_64"
 cp "target/$windows/release/trashpanda.exe" "$out/trashpanda-windows-x86_64.exe"
 
 # The trusted comment is signed too; the program checks it names this version
